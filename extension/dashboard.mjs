@@ -66,6 +66,13 @@ export class Dashboard{
     this.$('settings-open').addEventListener('click',()=>this.openSettings());this.$('settings-close').addEventListener('click',()=>this.$('settings-dialog').close());
     this.$('add-provider').addEventListener('click',()=>{const id='m-'+(globalThis.crypto?.randomUUID?.()??Date.now().toString(36));this.settingsDraft.push({id,name:'新模型',url:'',color:'#168779',enabled:true,voting:false,custom:true,selectors:{}});this.renderSettings();});
     this.$('settings-form').addEventListener('submit',event=>{event.preventDefault();this.saveSettings();});
+    this.$('update-extension').addEventListener('click',()=>this.updateExtension());
+  }
+  updateExtension(){
+    if(this.starting||this.imageLoading){this.feedback('请等待当前操作完成，再更新扩展。');return;}
+    if(this.state.run&&!this.state.run.cancelled){this.feedback('请先点击“清空 / 下一题”结束本题，再更新扩展。');return;}
+    this.feedback('正在启动本地更新工具。首次使用请先双击安装目录中的“更新并答.cmd”。更新完成后，在 Edge 重新加载并答，再刷新面板和模型网页。',false);
+    try{this.document.defaultView.location.assign('bingda-ai-update://run/');}catch{this.feedback('无法启动更新工具，请先双击安装目录中的“更新并答.cmd”。');}
   }
   setState(state){if(!state||!Array.isArray(state.providers))return;if(state.run?.id!==this.state.run?.id)this.sentQuestion=null;if(['auto','single','multiple','judgment'].includes(state.run?.questionType))this.questionType=state.run.questionType;this.state=state;this.$('build-version').textContent=this.preview?`界面预览 ${BUILD}`:state.build===BUILD?`版本${BUILD}`:'后台未更新，请刷新扩展';this.render();}
   async command(type,payload={}){

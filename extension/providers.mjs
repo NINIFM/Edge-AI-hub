@@ -9,7 +9,7 @@ const BUILTINS = [
     selectors:{input:'.chat-input-editor[contenteditable="true"][data-lexical-editor="true"]',send:'.send-button-container:not(.disabled):not(.loading):not(.stop)',response:'.chat-content-item-assistant .toolcall-rollup__part > .markdown-container:not(.toolcall-content-text) > .markdown',responseRoot:'.chat-content-item-assistant[data-archer-id]',stop:'.send-button-container.stop',done:'.segment-assistant-actions svg[name="Refresh"]',attachment:'[data-testid="input-attachment-list"] .image-thumbnail'}}
 ];
 export const SELECTOR_FIELDS = ['input','send','response','responseRoot','stop','done','attachment'];
-export const BUILD = '1.0';
+export const BUILD = '1.1';
 export const CONTENT_REVISION = 8;
 export const defaults = () => structuredClone(BUILTINS);
 export function migrateProviders(input,{addBuiltins=false}={}) {

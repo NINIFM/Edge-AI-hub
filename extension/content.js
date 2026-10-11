@@ -1,7 +1,7 @@
 (() => {
   if (globalThis.__edgeAnswerHubContentInstalled) return;
   globalThis.__edgeAnswerHubContentInstalled = true;
-  const BUILD = '1.0';
+  const BUILD = '1.1';
   const CONTENT_REVISION = 8;
   let active = null;
   // Keep the website task until its stop action has been acknowledged.
