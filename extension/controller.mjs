@@ -1,0 +1,252 @@
+import {defaults,sanitizeProviders,migrateProviders,originPattern,SELECTOR_FIELDS,BUILD,CONTENT_REVISION} from './providers.mjs';
+import {validateQuestion,buildPrompt,normalizeAnswer,extractAnswer,isUncertainResponse} from './core.mjs';
+
+const clone=v=>structuredClone(v);
+const terminal=r=>['completed','uncertain','error'].includes(r.status);
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function fingerprint(q) {
+  const value=JSON.stringify([q.type,q.text,q.images.map(i=>[i.mime,i.dataUrl])]);
+  const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value));
+  return [...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+export function createController(api) {
+  let providers=defaults(),run=null,tabMap={},calibrations={},metadataQueue=Promise.resolve(),intent=0;
+  const replyVersions=new WeakMap(),readSequences=new WeakMap();
+  const ready=(async()=>{
+    const [local,session]=await Promise.all([api.storage.local.get('providers'),api.storage.session.get(['activeTask','run','tabMap','calibrations'])]);
+    if(local.providers) {try{providers=migrateProviders(local.providers,{addBuiltins:true});if(JSON.stringify(providers)!==JSON.stringify(local.providers))await api.storage.local.set({providers})}catch{ /* Keep valid defaults. */ }}
+    tabMap=session.tabMap||{};calibrations=session.calibrations||{};
+    const task=Object.hasOwn(session,'activeTask')?session.activeTask:session.run;
+    if(task?.providers){
+      const selected=migrateProviders(task.providers);
+      run={id:task.id,questionType:task.questionType,startedAt:task.startedAt,questionHash:task.questionHash,providers:selected,cancelled:Boolean(task.cancelled),results:{}};
+      for(const p of selected){
+        const saved=task.results?.[p.id]||{},r=blank(p,task.id,saved.attempt||1);
+        if(Number.isInteger(saved.tabId))r.tabId=saved.tabId;
+        if(saved.manualOverride||saved.source==='manual')Object.assign(r,{status:'needs_confirmation',source:'manual',error:'人工答案未缓存，请重新补录。'});
+        else r.status=Number.isInteger(r.tabId)?'generating':'opening';
+        if(run.cancelled)Object.assign(r,{status:'error',error:'已停止本题'});
+        run.results[p.id]=r;
+      }
+    }
+    if(Object.hasOwn(session,'run')){
+      await persistControl();
+      await api.storage.session.remove('run');
+    }
+  })();
+  const state=()=>{
+    const view=clone({providers,run,build:BUILD});
+    for(const result of Object.values(view.run?.results||{}))delete result.text;
+    return view;
+  };
+  function taskMetadata() {
+    if(!run)return null;
+    return {id:run.id,questionType:run.questionType,startedAt:run.startedAt,questionHash:run.questionHash,providers:clone(run.providers),cancelled:Boolean(run.cancelled),
+      results:Object.fromEntries(Object.entries(run.results).map(([id,r])=>[id,{providerId:r.providerId,runId:r.runId,attempt:r.attempt,tabId:r.tabId,manualOverride:r.source==='manual'}]))};
+  }
+  function persistControl() {
+    const snapshot={activeTask:taskMetadata(),tabMap:clone(tabMap),calibrations:clone(calibrations)};
+    metadataQueue=metadataQueue.catch(()=>{}).then(()=>api.storage.session.set(snapshot));
+    return metadataQueue;
+  }
+  async function publish() {
+    try{await api.runtime.sendMessage({type:'hub:state',state:state()})}catch{ /* No dashboard open. */ }
+  }
+  async function publishControl() {
+    await Promise.all([publish(),persistControl()]);
+  }
+  function applyReply(r,reply,fromRead=false) {
+    if(r.source==='manual')return;
+    const incoming=String(reply.text||'').slice(0,60000);
+    const statusOnly=!fromRead&&!incoming&&['sending','generating'].includes(reply.status);
+    const text=statusOnly?r.text:incoming;
+    const uncertain=isUncertainResponse(text),answer=reply.ambiguous?null:extractAnswer(text,run.questionType);
+    const done=fromRead?reply.done===true&&!reply.stopped:reply.status==='completed';
+    let status,error=String(reply.error||'').slice(0,1000);
+    if(reply.status==='error')status='error';
+    else if(done)status=uncertain?'uncertain':answer?'completed':'needs_confirmation';
+    else if(fromRead&&reply.status==='sending')status='sending';
+    else if(fromRead)status=reply.stopped?'generating':reply.ambiguous||reply.status==='needs_confirmation'?'needs_confirmation':'generating';
+    else status=reply.status;
+    if(reply.ambiguous&&!error)error='本题回复匹配不明确，请打开模型网页核对。';
+    Object.assign(r,{status,text,answer:status==='error'||uncertain?null:answer,error,readDelayed:false,updatedAt:Date.now()});
+    replyVersions.set(r,(replyVersions.get(r)||0)+1);
+  }
+  async function refresh() {
+    const task=run;if(!task||task.cancelled)return;
+    await Promise.allSettled(task.providers.map(async p=>{
+      const r=task.results[p.id];if(!r||r.source==='manual'||!Number.isInteger(r.tabId)||['opening','sending','error'].includes(r.status))return;
+      const id=task.id,attempt=r.attempt,tabId=r.tabId,version=replyVersions.get(r)||0,sequence=(readSequences.get(r)||0)+1;
+      readSequences.set(r,sequence);
+      const valid=()=>run===task&&run.id===id&&!run.cancelled&&run.results[p.id]===r&&r.attempt===attempt&&r.tabId===tabId&&r.source!=='manual'&&(replyVersions.get(r)||0)===version&&readSequences.get(r)===sequence;
+      const official=tab=>tab.url&&new URL(tab.url).origin===new URL(p.url).origin&&(!tab.pendingUrl||new URL(tab.pendingUrl).origin===new URL(p.url).origin);
+      let timer;
+      try{
+        const reading=(async()=>{
+          const tab=await api.tabs.get(tabId);if(!valid())return;
+          if(!official(tab))throw Error('模型页面已离开授权域名，请打开网页检查。');
+          const reply=await api.tabs.sendMessage(tabId,{type:'site:read',providerId:p.id,runId:id,attempt});
+          if(!valid())return;
+          const latestTab=await api.tabs.get(tabId);if(!valid())return;
+          if(!official(latestTab))throw Error('模型页面已离开授权域名，请打开网页检查。');
+          if(!reply?.ok)throw Error(reply?.error||'未找到本题回复或页面任务已失效，请打开模型网页检查。');
+          return reply;
+        })();
+        const timeout=new Promise((resolve,reject)=>{
+          timer=setTimeout(()=>reject(Object.assign(Error('网页读取超时，正在自动重试。'),{readTimeout:true})),3000);
+        });
+        const reply=await Promise.race([reading,timeout]);
+        if(!valid())return;
+        applyReply(r,reply,true);
+      }catch(error){
+        if(valid()){
+          Object.assign(r,{status:error.readTimeout?'generating':'needs_confirmation',text:'',answer:null,
+            readDelayed:Boolean(error.readTimeout),error:'无法读取本题回复：'+(error.message||String(error)),updatedAt:Date.now()});
+          replyVersions.set(r,version+1);
+        }
+      }finally{
+        clearTimeout(timer);
+      }
+      // Publish each model as soon as it returns; another tab may be asleep or unresponsive.
+      if(run===task&&!task.cancelled)await publish();
+    }));
+  }
+  const current=(id,attempt,pid)=>run?.id===id && run.results[pid]?.attempt===attempt && !run.cancelled && !terminal(run.results[pid]);
+  function provider(id){const p=providers.find(p=>p.id===id);if(!p)throw Error('找不到此模型');return p}
+  async function permitted(p){if(!await api.permissions.contains({origins:[originPattern(p.url)]}))throw Error('请在模型设置中授权该 AI 网站，然后重试')}
+  async function dedicated(p,active=false,valid=()=>true){
+    await permitted(p);
+    let tab;try{if(tabMap[p.id])tab=await api.tabs.get(tabMap[p.id])}catch{}
+    // A user may have navigated our tab elsewhere. Never replace that page.
+    if(tab && (!tab.url || new URL(tab.url).origin!==new URL(p.url).origin || (tab.pendingUrl && new URL(tab.pendingUrl).origin!==new URL(p.url).origin)))tab=null;
+    if(!valid())throw Error('本次操作已取消');
+    if(!tab)tab=await api.tabs.create({url:p.url,active});
+    else if(active)tab=await api.tabs.update(tab.id,{active:true});
+    tabMap[p.id]=tab.id;return tab;
+  }
+  async function inject(p,tabId,valid=()=>true){
+    const end=Date.now()+30000;
+    while(Date.now()<end){
+      if(!valid())throw Error('该次发送已取消');
+      const tab=await api.tabs.get(tabId);
+      if(tab.url && new URL(tab.url).origin!==new URL(p.url).origin)throw Error('AI 页面跳转到了其他域名，请检查登录状态');
+      if(tab.status==='complete'){
+        await api.scripting.executeScript({target:{tabId},files:['content.js']});
+        if(!valid())throw Error('该次发送已取消');
+        const ack=await api.tabs.sendMessage(tabId,{type:'site:ping'});
+        if(ack?.ok){if(ack.build!==BUILD||ack.contentRevision!==CONTENT_REVISION)throw Error('页面适配版本未更新，请刷新模型网页后再发送');return;}
+      }
+      await sleep(250);
+    }
+    throw Error('AI 页面加载超时，请打开网页检查网络或登录状态');
+  }
+  async function dispatch(p,q,id,attempt){
+    const valid=()=>current(id,attempt,p.id);
+    try{
+      if(!valid())return;
+      const tab=await dedicated(p,false,valid);
+      if(!valid())return;
+      run.results[p.id].tabId=tab.id;await publishControl();
+      await inject(p,tab.id,valid);
+      if(!valid())return;
+      Object.assign(run.results[p.id],{status:'sending',updatedAt:Date.now()});await publish();
+      if(!valid())return;
+      const message={type:'site:start',build:BUILD,contentRevision:CONTENT_REVISION,provider:clone(p),question:q,prompt:buildPrompt(q),runId:id,attempt};
+      let ack=await api.tabs.sendMessage(tab.id,message);
+      if(ack?.resetRequired){
+        if(!await resetDraft(p,tab.id,valid))return;
+        await inject(p,tab.id,valid);if(!valid())return;
+        ack=await api.tabs.sendMessage(tab.id,message);
+      }
+      if(!ack?.ok)throw Error(ack?.error||'页面未接受发送请求');
+    }catch(e){if(valid()){Object.assign(run.results[p.id],{status:'error',error:e.message,updatedAt:Date.now()});await publish()}}
+  }
+  async function resetDraft(p,tabId,valid=()=>true){
+    if(!valid())return false;
+    const tab=await api.tabs.get(tabId);if(!valid())return false;
+    if(!tab.url||new URL(tab.url).origin!==new URL(p.url).origin||(tab.pendingUrl&&new URL(tab.pendingUrl).origin!==new URL(p.url).origin))throw Error('模型页面已离开授权域名，未重置其他网页。');
+    await api.tabs.reload(tabId);return true;
+  }
+  async function cancelSites(targetRun=run,valid=()=>true){
+    const results=Object.values(targetRun?.results||{}).filter(r=>Number.isInteger(r.tabId));
+    await Promise.allSettled(results.map(async r=>{
+      if(!valid())return;
+      const ack=await api.tabs.sendMessage(r.tabId,{type:'site:cancel',runId:r.runId,attempt:r.attempt,stopGeneration:true});
+      const p=targetRun.providers.find(p=>p.id===r.providerId);
+      if(ack?.resetRequired&&p&&valid())await resetDraft(p,r.tabId,valid);
+    }));
+  }
+  function blank(p,id,attempt=1){return {providerId:p.id,runId:id,attempt,status:'opening',text:'',answer:null,error:'',source:'auto',updatedAt:Date.now()}}
+  function siteResult(m,sender){
+    const r=run?.results[m.providerId],p=run?.providers.find(p=>p.id===m.providerId);
+    if(!r||!p||run.cancelled||m.runId!==run.id||m.attempt!==r.attempt||sender.tab?.id!==r.tabId||sender.frameId>0)throw Error('已忽略不匹配的页面消息');
+    if(new URL(sender.url||'https://invalid.test').origin!==new URL(p.url).origin)throw Error('消息来源域名不匹配');
+    return r;
+  }
+  async function handle(m={},sender={}){
+    try{
+      await ready;
+      if(m.type==='site:update'){
+        const r=siteResult(m,sender);
+        if(r.source!=='manual'){
+          if(!['sending','generating','needs_confirmation','completed','error'].includes(m.status))throw Error('无效页面状态');
+          applyReply(r,m);
+          await publish();
+        }
+        return {ok:true};
+      }
+      if(m.type==='site:calibrated'){
+        const c=calibrations[m.token],p=provider(m.providerId);
+        if(!c||c.providerId!==p.id||c.field!==m.field||c.tabId!==sender.tab?.id||sender.frameId>0||Date.now()>c.expires||new URL(sender.url||'https://invalid.test').origin!==new URL(p.url).origin)throw Error('校准消息不匹配');
+        if(typeof m.selector!=='string'||!m.selector||m.selector.length>1500)throw Error('校准选择器无效');
+        p.selectors[m.field]=m.selector;delete calibrations[m.token];await api.storage.local.set({providers});await publishControl();return {ok:true};
+      }
+      if(sender.url!==api.runtime.getURL('dashboard.html'))throw Error('仅允许从并答面板发起操作');
+      if(m.type==='hub:get'||m.type==='hub:refresh'){await refresh();return {ok:true,state:state()};}
+      if(m.type==='hub:saveProviders'){
+        const ps=sanitizeProviders(m.providers);await Promise.all(ps.filter(p=>p.enabled).map(permitted));providers=ps;await api.storage.local.set({providers});await publish();
+      }else if(m.type==='hub:open'){
+        await dedicated(provider(m.providerId),true);await publishControl();
+      }else if(m.type==='hub:start'){
+        const errors=validateQuestion(m.question);if(errors.length)throw Error(errors.join('；'));
+        const selected=providers.filter(p=>p.enabled&&(!m.providerIds||m.providerIds.includes(p.id)));
+        if(!selected.length)throw Error('至少启用一个模型');
+        const ticket=++intent,hash=await fingerprint(m.question);if(ticket!==intent)throw Error('此请求已被后续操作替代');
+        if(run)run.cancelled=true;
+        await cancelSites(run,()=>ticket===intent);if(ticket!==intent)throw Error('此请求已取消');
+        const id=crypto.randomUUID();run={id,questionType:m.question.type,startedAt:Date.now(),questionHash:hash,providers:clone(selected),results:Object.fromEntries(selected.map(p=>[p.id,blank(p,id)]))};
+        if(m.manualOnly)for(const r of Object.values(run.results))r.status='idle';
+        await publishControl();
+        if(!m.manualOnly)await Promise.allSettled(selected.map(p=>dispatch(p,m.question,id,1)));
+      }else if(m.type==='hub:retry'){
+        if(!run||run.cancelled)throw Error('请先开始一题');
+        const errors=validateQuestion(m.question);if(errors.length)throw Error(errors.join('；'));
+        const id=run.id,hash=await fingerprint(m.question);
+        if(run?.id!==id||run.cancelled||hash!==run.questionHash)throw Error('重试必须使用本题发送时的原文字和原图片');
+        const p=run.providers.find(p=>p.id===m.providerId),old=run.results[m.providerId];if(!p||!old)throw Error('本题未包含此模型');
+        const updated=providers.find(provider=>provider.id===p.id);
+        if(updated){p.selectors=clone(updated.selectors);p.sendEvent=updated.sendEvent;}
+        const attempt=old.attempt+1;run.results[p.id]=blank(p,id,attempt);await publishControl();
+        await cancelSites({providers:[p],results:{[p.id]:old}},()=>current(id,attempt,p.id));
+        await dispatch(p,m.question,id,attempt);
+      }else if(m.type==='hub:manual'||m.type==='hub:confirm'){
+        const r=run?.results[m.providerId];if(!r)throw Error('请先开始一题');
+        if(m.type==='hub:confirm'&&(r.status==='uncertain'||isUncertainResponse(r.text)))throw Error('模型已明确无法确认，请重试或核对后人工补录答案');
+        const answer=m.type==='hub:manual'?normalizeAnswer(m.answer,run.questionType):extractAnswer(r.text,run.questionType);
+        if(!answer)throw Error('未找到明确答案，请手动填写完整答案');
+        if(m.type==='hub:confirm'&&r.status!=='needs_confirmation')throw Error('请等待回复结束后再确认');
+        Object.assign(r,{status:'completed',answer,error:'',readDelayed:false,source:'manual',updatedAt:Date.now()});await publishControl();
+      }else if(m.type==='hub:cancel'||m.type==='hub:clear'){
+        const ticket=++intent,oldRun=run;if(oldRun){oldRun.cancelled=true;for(const r of Object.values(oldRun.results))if(!terminal(r))Object.assign(r,{status:'error',error:'已停止本题',answer:null})}
+        if(m.type==='hub:clear')run=null;await publishControl();await cancelSites(oldRun,()=>ticket===intent);
+      }else if(m.type==='hub:calibrate'){
+        if(!SELECTOR_FIELDS.includes(m.field))throw Error('校准字段无效');
+        const p=provider(m.providerId),tab=await dedicated(p,true);await inject(p,tab.id);
+        const token=crypto.randomUUID();calibrations[token]={providerId:p.id,field:m.field,tabId:tab.id,expires:Date.now()+120000};
+        await publishControl();await api.tabs.sendMessage(tab.id,{type:'site:calibrate',providerId:p.id,field:m.field,token});
+      }else throw Error('未知操作');
+      return {ok:true,state:state()};
+    }catch(e){return {ok:false,error:e.message||String(e)}}
+  }
+  return {handle};
+}

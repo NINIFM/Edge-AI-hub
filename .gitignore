@@ -1,0 +1,9 @@
+*.zip
+node_modules/
+tests/
+preview/
+.env
+.env.*
+*.log
+Thumbs.db
+Desktop.ini
