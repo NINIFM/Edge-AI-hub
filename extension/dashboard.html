@@ -1,17 +1,17 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>并答 1.1 · 答题汇总</title><link rel="stylesheet" href="dashboard.css?v=1.1"></head>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>并答 1.2 · 答题汇总</title><link rel="stylesheet" href="dashboard.css?v=1.2"></head>
 <body>
-<header class="topbar"><a class="brand" href="dashboard.html"><span class="brandmark" aria-hidden="true">答</span><span>答题汇总<small>EDGE ANSWER HUB</small></span></a><nav aria-label="主导航"><span class="prototype" id="build-version">版本1.1</span><a href="help.html" target="_blank" rel="noopener">使用说明 ↗</a><button id="update-extension" class="button secondary" type="button" title="首次先双击安装目录中的更新并答.cmd">一键更新</button><button id="settings-open" class="button subtle">模型设置</button></nav></header>
+<header class="topbar"><a class="brand" href="dashboard.html"><span class="brandmark" aria-hidden="true">答</span><span>答题汇总<small>EDGE ANSWER HUB</small></span></a><nav aria-label="主导航"><span class="prototype" id="build-version">版本1.2</span><a href="help.html" target="_blank" rel="noopener">使用说明 ↗</a><button id="update-extension" class="button secondary" type="button" title="首次先双击安装目录中的更新并答.cmd">一键更新</button><button id="settings-open" class="button subtle">模型设置</button></nav></header>
 <main>
-<div id="preview-notice" class="notice" hidden>当前为界面预览：未连接 Edge 扩展，网页发送不可用。可添加题目并手动录入答案，体验汇总与投票。</div>
+<div id="preview-notice" class="notice" hidden>当前为界面预览：请在 Edge 中加载扩展后发送题目。</div>
 <div class="page-heading"><div><p class="eyebrow">同一题目，多方参考</p><h1>把答案放在一起看</h1><p>手动提供题目与原图，分别查看模型回答，再参考完整答案的共识。</p></div><span class="privacy-note"><span aria-hidden="true">◇</span> 题目仅保留在本次会话</span></div>
 <section class="composer panel" aria-labelledby="question-heading">
 <div class="section-heading"><h2 id="question-heading"><span class="step">01</span> 添加题目</h2><div id="type-group" class="segmented" role="group" aria-label="答案格式"><button type="button" data-type="auto" aria-pressed="true" title="接受完整选项组合或正确、错误，不自动判断题型">不限定题型</button><button type="button" data-type="single" aria-pressed="false">单选</button><button type="button" data-type="multiple" aria-pressed="false">多选</button><button type="button" data-type="judgment" aria-pressed="false">判断</button></div></div>
 <label class="sr-only" for="question-text">题目文字</label><textarea id="question-text" rows="4" maxlength="30000" placeholder="在这里粘贴题干和选项，也可以直接粘贴截图…"></textarea>
 <div id="pastezone" class="pastezone" tabindex="0" role="group" aria-label="截图粘贴区域，按 Control 加 V 粘贴图片"><div><span class="image-symbol" aria-hidden="true">▧</span><span>点击这里，按 <kbd>Ctrl + V</kbd> 粘贴截图，可连续粘贴多张</span></div><small>最多 4 张 · 单张 ≤ 8 MiB · 合计 ≤ 20 MiB</small></div>
 <div id="image-previews" class="image-previews" aria-label="已添加的图片"></div>
-<div class="composer-footer"><p id="composer-hint">各模型在原会话连续答题；截图直接 Ctrl+V。</p><div class="actions"><button id="clear-question" class="button subtle" type="button" title="停止本题并清空面板，保留各模型原会话">清空 / 下一题</button><button id="start-manual" class="button secondary" type="button">手动汇总</button><button id="start-question" class="button primary" type="button"><span aria-hidden="true">↗</span> 一键发送</button></div></div>
+<div class="composer-footer"><p id="composer-hint">各模型在原会话连续答题；截图直接 Ctrl+V。</p><div class="actions"><button id="clear-question" class="button subtle" type="button" title="停止本题并清空面板，保留各模型原会话">清空 / 下一题</button><button id="start-question" class="button primary" type="button"><span aria-hidden="true">↗</span> 一键发送</button></div></div>
 </section>
 <div id="feedback" role="status" aria-live="polite" hidden></div>
 <section class="results-section" aria-labelledby="results-heading"><div class="section-heading"><h2 id="results-heading"><span class="step">02</span> 模型回答</h2><div class="result-tools"><span id="run-summary">等待添加题目</span><button id="cancel-run" class="text-button" hidden>停止本题</button></div></div><div id="provider-cards" class="provider-grid"></div></section>
@@ -19,5 +19,5 @@
 <footer>使用已登录的 AI 官方网页 · 各模型在原会话连续答题 · 请自行核对答案</footer>
 </main>
 <dialog id="settings-dialog" aria-labelledby="settings-heading"><form id="settings-form"><div class="dialog-heading"><div><p class="eyebrow">你的模型工作台</p><h2 id="settings-heading">模型设置</h2></div><button type="button" id="settings-close" class="button subtle" aria-label="关闭模型设置">关闭</button></div><p class="settings-note">启用决定是否发送题目；参与投票决定是否计入严格过半。新增模型默认仅供参考。页面控件可留空，再到原网页点选校准。</p><div id="settings-providers"></div><button type="button" id="add-provider" class="button secondary">＋ 添加模型</button><div id="settings-feedback" role="status" aria-live="polite"></div><div class="dialog-footer"><small>新增模型需授权其具体 HTTPS 网站；仅保存模型配置。</small><button id="save-settings" type="submit" class="button primary">保存设置</button></div></form></dialog>
-<script type="module" src="dashboard.mjs?v=1.1"></script>
+<script type="module" src="dashboard.mjs?v=1.2"></script>
 </body></html>

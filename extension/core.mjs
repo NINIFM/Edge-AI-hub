@@ -41,7 +41,8 @@ export function normalizeAnswer(value, type) {
 }
 
 function normalizeFinalAnswer(value, type) {
-  const answer = normalizeAnswer(value, type);
+  // Some webpages decorate an explicit final answer with a trailing check mark.
+  const answer = normalizeAnswer(value, type) ?? normalizeAnswer(value.replace(/\s*[✅☑✔✓]\uFE0F?\s*$/, ''), type);
   if (answer !== null) return answer;
   // GLM may append an "即..." explanation to its explicit final token. Keep other prose strict.
   const explained = value.match(/^(.+?)\s*(?:（\s*即\s*([^（）()\r\n]+)）|\(\s*即\s*([^（）()\r\n]+)\))\s*[。.]?\s*$/);
@@ -82,7 +83,7 @@ export function extractAnswer(text, type) {
 }
 
 function completedAnswer(result) {
-  if (!result || result.status !== 'completed' || (result.source !== 'manual' && isUncertainResponse(result.text))) return null;
+  if (!result || result.status !== 'completed' || isUncertainResponse(result.text)) return null;
   return normalizeAnswer(result.answer, 'judgment') ?? normalizeAnswer(result.answer, 'multiple');
 }
 

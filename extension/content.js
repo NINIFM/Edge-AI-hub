@@ -1,8 +1,8 @@
 (() => {
   if (globalThis.__edgeAnswerHubContentInstalled) return;
   globalThis.__edgeAnswerHubContentInstalled = true;
-  const BUILD = '1.1';
-  const CONTENT_REVISION = 8;
+  const BUILD = '1.2';
+  const CONTENT_REVISION = 9;
   let active = null;
   // Keep the website task until its stop action has been acknowledged.
   let pageGeneration = null;
@@ -128,15 +128,14 @@
     // Paste failure is reported directly; no second image dispatch can duplicate attachments.
     await waitFor(task, () => {
       const attachments = findAll(selectors.attachment).filter(visible);
-      const uploading = '[aria-busy="true"], [role="progressbar"], progress, [data-state="uploading"], [data-uploading="true"], .uploading, .is-uploading, .loading, .ds-loading';
+      const uploading = '[aria-busy="true"], [role="progressbar"], progress, [data-state="uploading"], [data-uploading="true"], .uploading, .is-uploading, .loading, .ds-loading, .animate-spin';
       const attachmentReady = element => {
-        if (task.provider.id === 'kimi' && !element.classList.contains('success')) return false;
         if ((element.matches(uploading) && uploadingVisible(element)) || findAll(uploading, element).some(uploadingVisible)) return false;
         const previews = element instanceof HTMLImageElement ? [element] : findAll('img', element);
         return previews.length > 0 && previews.every(image => {
           const source = image.currentSrc || image.src;
-          const localDeepSeekPreview = task.provider.id === 'deepseek' && source.startsWith(`blob:${location.origin}/`);
-          return image.complete && image.naturalWidth > 0 && (/^https:\/\//i.test(source) || localDeepSeekPreview);
+          const localPreview = ['deepseek','step'].includes(task.provider.id) && source.startsWith(`blob:${location.origin}/`);
+          return image.complete && image.naturalWidth > 0 && (/^https:\/\//i.test(source) || localPreview);
         });
       };
       return attachments.length === images.length && attachments.every(attachmentReady) && ready(find(selectors.send));
@@ -147,7 +146,7 @@
     if (!root) return null;
     const attributes = ['data-virtual-list-item-key', 'data-message-id', 'data-answer-id', 'data-turn-id', 'id'];
     if (providerId === 'qwen') attributes.unshift('data-chat-answers-wrap');
-    if (providerId === 'kimi') attributes.unshift('data-archer-id');
+    if (providerId === 'hunyuan') attributes.unshift('data-trace-id');
     for (const attribute of attributes) {
       const value = root.getAttribute(attribute);
       if (value) return `${attribute}:${value}`;
@@ -157,6 +156,10 @@
       const markers = findAll('.interact-container[id^="interactContainer-"]', root);
       if (markers.length === 1) return `glm:${markers[0].getAttribute('id')}`;
     }
+    if (providerId === 'step') {
+      const marker = root.querySelector('[data-slot="collapsible-content"][id]');
+      if (marker) return `step:${marker.id}`;
+    }
     return null;
   }
   function responseEvidence(task) {
@@ -164,7 +167,8 @@
     const snapshot = task.snapshot;
     if (!snapshot) return null;
     const qwen = task.provider.id === 'qwen';
-    const candidates = findAll(selectors.response);
+    const finalElement = element => task.provider.id !== 'hunyuan' || !element.closest('.hyc-component-deepsearch-cot__think');
+    const candidates = findAll(selectors.response).filter(finalElement);
     const rootTexts = new Map();
     const textOf = element => (element.innerText ?? element.textContent).trim();
     const rootText = root => {
@@ -215,7 +219,7 @@
     const keyedQwen = qwen && turnKey(safeRoot, task.provider.id) && !snapshot.keys.has(turnKey(safeRoot, task.provider.id));
     const done = safeRoot && selectors.done && findAll(selectors.done, safeRoot).some(element => {
       const reusedCurrentReply = keyedQwen && inRoot.some(reply => reply === element || reply.contains(element));
-      return (!snapshot.done.has(element) || reusedCurrentReply) && visible(element);
+      return (!snapshot.done.has(element) || reusedCurrentReply) && visible(element) && finalElement(element);
     });
     return { text, done, stopped, ambiguous, safeRoot };
   }
@@ -238,7 +242,7 @@
     return Boolean(pagePendingPaste);
   }
   function canStartGeneration(provider, previous) {
-    if (provider.id === 'kimi' && findAll('.send-button-container.loading').some(visible)) return false;
+    if (provider.id === 'step' && findAll('button[aria-label="发送"] .lucide-loader-circle').some(visible)) return false;
     if (provider.selectors?.stop && findAll(provider.selectors.stop).some(visible)) return false;
     if (!previous) return true;
     if (retainedPrompt(previous)) return true;
@@ -250,11 +254,72 @@
     if (provider.sendEvent === 'mousedown') button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, buttons: 1, view: window }));
     else button.click();
   }
+  async function initializeMode(task) {
+    const label = element => (element.innerText ?? element.textContent).replace(/\s+/g, '');
+    const named = (selector, pattern) => findAll(selector).find(element => ready(element) && pattern.test(label(element)));
+    const control = (selector, pattern) => waitFor(task, () => pattern ? named(selector, pattern) : find(selector), 5000,
+      `无法设置初始模式 ${task.provider.defaultMode}，请打开原网页检查模型选项。`);
+    const verify = predicate => waitFor(task, predicate, 5000, `初始模式 ${task.provider.defaultMode} 未生效，尚未发送题目。`);
+    const id = task.provider.id;
+    if (id === 'deepseek') {
+      for (const pattern of [/^深度思考$/, /^(智能搜索|联网搜索)$/]) {
+        const toggle = await control('.ds-toggle-button', pattern);
+        if (toggle.getAttribute('aria-pressed') !== 'true') toggle.click();
+        await verify(() => toggle.getAttribute('aria-pressed') === 'true');
+      }
+    } else if (id === 'step') {
+      const trigger = await control('button[aria-label="选择模型"]');
+      if (label(trigger) !== 'Step5Preview') {
+        trigger.click();
+        (await control('[role="menuitem"],[role="menuitemradio"]', /^Step5Preview/)).click();
+      }
+      await verify(() => label(trigger) === 'Step5Preview');
+    } else if (id === 'qwen') {
+      const trigger = await control('button[aria-haspopup="menu"]', /^(快速|思考研究)$/);
+      if (label(trigger) !== '快速') {
+        trigger.click();
+        (await control('[role="menuitemradio"],[role="menuitemcheckbox"],[role="menuitem"]', /^快速/)).click();
+      }
+      await verify(() => label(trigger) === '快速');
+    } else if (id === 'glm') {
+      const trigger = await control('.think-mode-trigger');
+      const flashPattern = /^GLM-Flash.*5\.3-Flash/;
+      if (!named('.think-mode-item', flashPattern)) trigger.click();
+      const flash = await control('.think-mode-item', flashPattern);
+      if (!flash.classList.contains('selected')) flash.click();
+      if (!label(trigger).includes('深度')) {
+        if (!named('.think-mode-item', flashPattern)) trigger.click();
+        (await control('.item-name-container')).click();
+        (await control('.think-mode-item', /^深度/)).click();
+      }
+      await verify(() => label(trigger).includes('GLM-Flash') && label(trigger).includes('深度'));
+      find(task.provider.selectors.input)?.click();
+    } else if (id === 'hunyuan') {
+      const trigger = await control('button[aria-label="切换模型"]');
+      if (trigger.getAttribute('aria-expanded') !== 'true') trigger.click();
+      let model = await control('button[aria-label="选择模型"]');
+      if (!/Hy3$/i.test(label(model))) {
+        model.click();
+        (await control('[role="menuitemradio"]', /^Hy3/i)).click();
+        await verify(() => trigger.getAttribute('aria-expanded') === 'false' || /Hy3$/i.test(label(find('button[aria-label="选择模型"]') || model)));
+        if (trigger.getAttribute('aria-expanded') !== 'true') trigger.click();
+        model = await control('button[aria-label="选择模型"]');
+      }
+      await verify(() => /Hy3$/i.test(label(model)));
+      const deep = await control('[role="menuitemradio"]', /^深度思考/);
+      if (deep.getAttribute('aria-checked') === 'true') trigger.click();
+      else deep.click();
+      await verify(() => label(trigger).includes('深度思考'));
+    }
+    if (!current(task)) return;
+    const ack = await chrome.runtime.sendMessage({type:'site:defaultsApplied',providerId:id,runId:task.runId,attempt:task.attempt});
+    if (!ack?.ok) throw Error('初始模式未能保存，请重试本模型。');
+  }
   async function interruptGeneration(task, provider, previous = pageGeneration) {
     let requested = Boolean(previous?.stopRequested);
     await waitFor(task, () => {
-      // Kimi shows a loading control before its clickable stop control appears.
-      if (provider.id === 'kimi' && findAll('.send-button-container.loading').some(visible)) return false;
+      // Step first shows a pending spinner, then exposes its clickable stop control.
+      if (provider.id === 'step' && findAll('button[aria-label="发送"] .lucide-loader-circle').some(visible)) return false;
       const stop = find(provider.selectors?.stop);
       if (stop) {
         if (!requested) {
@@ -343,6 +408,8 @@
       if (pageGeneration === task.previousGeneration) pageGeneration = null;
       task.previousGeneration = null;
       const input = await waitFor(task, () => { const element = find(selectors.input); return ready(element) && element; }, 5000, '找不到可用的题目输入框，请确认登录或校准页面。');
+      if (!current(task)) return;
+      if (message.initializeMode === true) await initializeMode(task);
       if (!current(task)) return;
       if (selectors.attachment && findAll(selectors.attachment).some(visible)) throw Error('输入区仍有旧图片或旧附件，请先在原页面移除，避免混入下一题。');
       await fillInput(task, input, message.prompt);

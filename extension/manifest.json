@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "并答 · 多模型答题助手",
-  "version": "1.1",
+  "version": "1.2",
   "description": "手动提供文字与图片，一键分发到 AI 网页，持续展示回复并按完整答案投票。",
   "minimum_chrome_version": "120",
   "permissions": ["storage", "scripting"],
-  "host_permissions": ["https://chatglm.cn/*", "https://chat.deepseek.com/*", "https://www.qianwen.com/*", "https://www.kimi.com/*"],
+  "host_permissions": ["https://chatglm.cn/*", "https://chat.deepseek.com/*", "https://www.qianwen.com/*", "https://studio.stepfun.com/*", "https://yuanbao.tencent.com/*"],
   "optional_host_permissions": ["https://*/*"],
   "background": {"service_worker": "worker.mjs", "type": "module"},
   "action": {"default_title": "打开并答面板"},

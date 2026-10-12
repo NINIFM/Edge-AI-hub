@@ -1,10 +1,10 @@
 import { validateQuestion, normalizeAnswer, recommend } from './core.mjs';
-import { BUILD } from './providers.mjs';
+import { BUILD, defaults } from './providers.mjs';
 const MIB=1024*1024;
 const IMAGE_TYPES=new Set(['image/png','image/jpeg','image/webp','image/gif']);
-const STATUSES={idle:'等待回答',opening:'正在打开网页',sending:'正在发送',generating:'正在生成',needs_confirmation:'待人工确认',completed:'已完成',uncertain:'无法确认',error:'出现异常'};
+const STATUSES={idle:'等待回答',opening:'正在打开网页',sending:'正在发送',generating:'正在生成',needs_confirmation:'请查看网页',completed:'已完成',uncertain:'无法确认',error:'出现异常'};
 const SELECTORS={input:'输入框',send:'发送按钮',response:'回答内容',responseRoot:'单轮回答容器',stop:'停止生成按钮',attachment:'已上传附件',done:'明确完成标记'};
-const PREVIEW_PROVIDERS=[{id:'glm',name:'GLM',url:'https://chatglm.cn/',color:'#168779'},{id:'deepseek',name:'DeepSeek',url:'https://chat.deepseek.com/',color:'#5b76c6'},{id:'qwen',name:'千问',url:'https://www.qianwen.com/',color:'#8865b7'},{id:'kimi',name:'Kimi',url:'https://www.kimi.com/',color:'#292a2d'}].map(p=>({...p,enabled:true,voting:true,custom:false,selectors:{}}));
+const PREVIEW_PROVIDERS=defaults();
 export function imageBatchErrors(existing,files){
   const errors=[];
   if(existing.length+files.length>4)errors.push('每题最多添加 4 张图片。');
@@ -61,7 +61,7 @@ export class Dashboard{
       if(files.length){event.preventDefault();this.addImages(files);}
     });
     this.$('pastezone').addEventListener('click',()=>this.$('pastezone').focus());
-    this.$('start-question').addEventListener('click',()=>this.start());this.$('start-manual').addEventListener('click',()=>this.start(true));
+    this.$('start-question').addEventListener('click',()=>this.start());
     this.$('clear-question').addEventListener('click',()=>this.clear());this.$('cancel-run').addEventListener('click',()=>this.command('hub:cancel'));
     this.$('settings-open').addEventListener('click',()=>this.openSettings());this.$('settings-close').addEventListener('click',()=>this.$('settings-dialog').close());
     this.$('add-provider').addEventListener('click',()=>{const id='m-'+(globalThis.crypto?.randomUUID?.()??Date.now().toString(36));this.settingsDraft.push({id,name:'新模型',url:'',color:'#168779',enabled:true,voting:false,custom:true,selectors:{}});this.renderSettings();});
@@ -86,13 +86,8 @@ export class Dashboard{
     try{await this.command('hub:refresh');}finally{this.readingAnswers=false;}
   }
   previewCommand(type,payload){
-    if(type==='hub:start'){
-      this.state.run={id:'preview-'+Date.now(),questionType:payload.question.type,providers:this.state.providers.map(p=>({...p})),results:{}};
-      this.state.run.providers.filter(p=>p.enabled).forEach(p=>{this.state.run.results[p.id]={status:'idle',text:'',source:'manual'};});
-    }else if(type==='hub:clear')this.state.run=null;
-    else if(type==='hub:manual'&&this.state.run)this.state.run.results[payload.providerId]={status:'completed',text:`最终答案：${payload.answer}`,answer:payload.answer,source:'manual'};
+    if(type==='hub:clear')this.state.run=null;
     else if(type==='hub:saveProviders')this.state.providers=payload.providers;
-    else if(type==='hub:cancel'){this.feedback('手动汇总没有后台生成任务。',false);return {ok:true};}
     else{this.feedback('界面预览未连接模型网页；请在 Edge 中加载扩展后操作。');return {ok:false};}
     this.render();return {ok:true,state:this.state};
   }
@@ -108,13 +103,13 @@ export class Dashboard{
       this.images=next.images;this.renderImages();this.feedback('',false);
     }catch(error){this.feedback(error.message);}finally{this.imageLoading=false;this.renderEditor();}
   }
-  async start(manualOnly=false){
-    if(this.state.run||this.starting||this.imageLoading)return;if(this.preview&&!manualOnly){this.feedback('预览模式只支持手动汇总。');return;}
+  async start(){
+    if(this.state.run||this.starting||this.imageLoading)return;if(this.preview){this.feedback('请在 Edge 中加载扩展后发送题目。');return;}
     const question={text:this.$('question-text').value.trim(),type:this.questionType,images:this.images.map(image=>({...image}))};
     const errors=validateQuestion(question);if(errors.length){this.feedback(errors.join(' '));return;}
     const providerIds=this.state.providers.filter(p=>p.enabled).map(p=>p.id);if(!providerIds.length){this.feedback('请先在模型设置中启用至少一个模型。');return;}
-    this.starting=true;this.renderEditor();const response=await this.command('hub:start',{question,providerIds,...(manualOnly?{manualOnly:true}:{})});
-    if(response.ok){this.sentQuestion=question;this.feedback(manualOnly?'本题已建立，可在各模型卡片中人工补录答案。':'已派发题目，请关注各模型的独立状态。',false);}
+    this.starting=true;this.renderEditor();const response=await this.command('hub:start',{question,providerIds});
+    if(response.ok){this.sentQuestion=question;this.feedback('已派发题目，请关注各模型的独立状态。',false);}
     this.starting=false;this.renderEditor();this.renderCards();
   }
   async retry(providerId){
@@ -122,20 +117,14 @@ export class Dashboard{
     await this.command('hub:retry',{providerId,question:{...this.sentQuestion,images:this.sentQuestion.images.map(image=>({...image}))}});
   }
   async clear(){if(this.imageLoading||this.starting)return;const response=await this.command('hub:clear');if(response.ok){this.sentQuestion=null;this.images=[];this.$('question-text').value='';this.renderImages();this.feedback('',false);this.render();this.$('question-text').focus();}}
-  async manual(providerId){
-    const card=this.cards.get(providerId);if(!card||!this.state.run)return;const answer=normalizeAnswer(card.querySelector('.manual-input').value,this.state.run.questionType);
-    if(!answer){this.feedback(this.state.run.questionType==='auto'?'请填写完整答案：A、AC 等完整选项组合，或正确 / 错误。':'请填写完整答案：单选填写一个字母，多选填写全部字母，判断填写正确或错误。');return;}
-    if(!card.querySelector('.manual-confirm').checked){this.feedback('请勾选“我已核对并确认本答案”，再提交人工答案。');return;}
-    await this.command('hub:manual',{providerId,answer});
-  }
   render(){this.renderEditor();this.renderCards();this.renderRecommendation();}
   renderEditor(){
     const locked=Boolean(this.state.run)||this.starting||this.imageLoading;this.$('question-text').disabled=locked;
     this.$('type-group').querySelectorAll('button').forEach(el=>{el.disabled=locked;el.setAttribute('aria-pressed',String(el.dataset.type===(this.state.run?.questionType??this.questionType)));});
-    this.$('start-manual').disabled=locked;this.$('start-question').disabled=locked||this.preview;
+    this.$('start-question').disabled=locked||this.preview;
     this.$('settings-open').disabled=Boolean(this.state.run)||this.starting;this.$('clear-question').disabled=this.imageLoading||this.starting;
     this.$('pastezone').classList.toggle('locked',locked);this.$('pastezone').setAttribute('aria-disabled',String(locked));this.$('image-previews').querySelectorAll('button').forEach(el=>el.disabled=locked);
-    this.$('composer-hint').textContent=this.imageLoading?'正在读取原图…':this.state.run?'清空会停止本题，下一题继续使用原会话。':this.preview?'界面预览：可手动汇总，网页发送不可用。':'各模型在原会话连续答题；截图直接 Ctrl+V。';
+    this.$('composer-hint').textContent=this.imageLoading?'正在读取原图…':this.state.run?'清空会停止本题，下一题继续使用原会话。':this.preview?'界面预览：请在 Edge 加载扩展后发送。':'各模型在原会话连续答题；截图直接 Ctrl+V。';
     this.$('cancel-run').hidden=this.preview||!Object.values(this.state.run?.results??{}).some(r=>['opening','sending','generating'].includes(r.status));
   }
   renderImages(){
@@ -155,34 +144,29 @@ export class Dashboard{
     const note=node(d,'p','result-note');const error=node(d,'p','provider-error');error.setAttribute('role','status');
     const actions=node(d,'div','card-actions');
     actions.append(button(d,'打开网页 ↗','text-button open-provider',()=>this.command('hub:open',{providerId:provider.id})),button(d,'重试本模型','text-button retry-provider',()=>this.retry(provider.id)),button(d,'确认网页已完成','button secondary confirm-provider',()=>this.command('hub:confirm',{providerId:provider.id})));
-    const details=node(d,'details','manual-entry');details.append(node(d,'summary','','人工补录答案'));
-    const label=node(d,'label','manual-label','完整答案');const input=node(d,'input','manual-input');input.type='text';input.maxLength=20;input.autocomplete='off';label.append(input);
-    const checkLabel=node(d,'label','check-label');const check=node(d,'input','manual-confirm');check.type='checkbox';checkLabel.append(check,d.createTextNode('我已核对并确认本答案'));
-    details.append(label,checkLabel,button(d,'提交人工答案','button secondary manual-submit',()=>this.manual(provider.id)),node(d,'small','','人工答案会覆盖本模型结果，并明确标记来源。'));
-    card.append(heading,meta,answer,note,error,actions,details);return card;
+    const mode=node(d,'p','provider-mode');
+    card.append(heading,mode,meta,answer,note,error,actions);return card;
   }
   renderCards(){
     const run=this.state.run;const providers=this.state.providers;const ids=new Set(providers.map(p=>p.id));
     this.cards.forEach((card,id)=>{if(!ids.has(id)){card.remove();this.cards.delete(id);}});
     providers.forEach(provider=>{
       let card=this.cards.get(provider.id);if(!card){card=this.makeCard(provider);this.cards.set(provider.id,card);this.$('provider-cards').append(card);}
-      if(card.dataset.runId!==(run?.id??'')){card.querySelector('.manual-input').value='';card.querySelector('.manual-confirm').checked=false;card.dataset.runId=run?.id??'';}
       const result=run?.results?.[provider.id];const enabled=run?Boolean(run.providers?.find(p=>p.id===provider.id)?.enabled):provider.enabled;
       card.style.setProperty('--provider-color',safeColor(provider.color));card.classList.toggle('disabled',!enabled);card.querySelector('.provider-symbol').textContent=provider.name.slice(0,1);card.querySelector('.provider-name').textContent=provider.name;
       const status=enabled?(result?.status??'idle'):'disabled';
       const valid=['generating','needs_confirmation','completed'].includes(status)?normalizeAnswer(result?.answer,run?.questionType):null;
       const captured=status==='generating'&&Boolean(valid);
       const statusElement=card.querySelector('.provider-status');statusElement.textContent=enabled?(result?.readDelayed?'读取延迟':captured?'已捕获答案':STATUSES[status]??'状态未知'):'未启用';statusElement.dataset.status=captured?'captured':status;
-      card.querySelector('.vote-label').textContent=provider.voting?'参与投票':'仅供参考';card.querySelector('.source-label').textContent=result?.source==='manual'?'人工补录':result?.source==='auto'&&valid?'网页直接捕获':'使用官方网页';
+      const mode=card.querySelector('.provider-mode');mode.hidden=!provider.defaultMode;mode.textContent=provider.defaultMode?`初始：${provider.defaultMode} · 原网页可调整`:'';
+      card.querySelector('.vote-label').textContent=provider.voting?'参与投票':'仅供参考';card.querySelector('.source-label').textContent=result?.source==='confirmed'?'网页完成确认':result?.source==='auto'&&valid?'网页直接捕获':'使用官方网页';
       const note=card.querySelector('.result-note');note.hidden=status==='completed';
-      note.textContent=!enabled?'在模型设置中启用后即可使用。':status==='sending'?'正在准备发送；上一题仍在生成时，会先停止再发送新题。':status==='needs_confirmation'?'请打开原网页核对本题回复，再确认或补录答案。':status==='uncertain'?'模型无法确认本题，完整回复可在原网页查看。':status==='error'?'请打开原网页检查，或重试本模型。':captured?'已读取本题答案，继续检查后续更正；完成后计入汇总。':run?'正在直接读取本题网页，识别到明确答案即显示。':'发送题目后，这里显示捕获到的答案。';
+      note.textContent=!enabled?'在模型设置中启用后即可使用。':status==='sending'?'正在准备发送；上一题仍在生成时，会先停止再发送新题。':status==='needs_confirmation'?'请打开原网页核对本题回复，再确认网页已完成或重试。':status==='uncertain'?'模型无法确认本题，完整回复可在原网页查看。':status==='error'?'请打开原网页检查，或重试本模型。':captured?'已读取本题答案，继续检查后续更正；完成后计入汇总。':run?'正在直接读取本题网页，识别到明确答案即显示。':'发送题目后，这里显示捕获到的答案。';
       card.querySelector('.answer-label').textContent=captured?'当前捕获':'完整答案';card.querySelector('.answer-value').textContent=valid??'—';card.querySelector('.provider-answer').classList.toggle('has-answer',Boolean(valid));
       card.querySelector('.provider-error').textContent=result?.error||(result?.status==='uncertain'?'模型已结束，但本题无法确认；此回复不参与投票。':result?.status==='completed'&&!valid?'已确认完成，但无法提取有效完整答案。':'');card.querySelector('.provider-error').hidden=!card.querySelector('.provider-error').textContent;
       card.querySelector('.open-provider').disabled=this.preview;card.querySelector('.retry-provider').hidden=!enabled||!run;card.querySelector('.retry-provider').disabled=this.preview||!this.sentQuestion||['opening','sending','generating'].includes(result?.status);
       card.querySelector('.retry-provider').title=!this.sentQuestion?'重新打开的面板缺少原始题目，请清空后重新发送。':'在本模型原会话中重发本题原文和原图';
       card.querySelector('.confirm-provider').hidden=result?.status!=='needs_confirmation';card.querySelector('.confirm-provider').disabled=this.preview||!valid;
-      card.querySelector('.manual-input').placeholder=(run?.questionType??this.questionType)==='auto'?'A / AC / 正确 / 错误':(run?.questionType??this.questionType)==='judgment'?'正确 / 错误':(run?.questionType??this.questionType)==='multiple'?'例如 AC':'例如 A';
-      card.querySelectorAll('.manual-input,.manual-confirm,.manual-submit').forEach(el=>el.disabled=!enabled||!run);
     });
     const results=Object.values(run?.results??{});
     const completed=results.filter(r=>r.status==='completed'&&normalizeAnswer(r.answer,run?.questionType)).length;

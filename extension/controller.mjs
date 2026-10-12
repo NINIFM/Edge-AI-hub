@@ -1,5 +1,5 @@
 import {defaults,sanitizeProviders,migrateProviders,originPattern,SELECTOR_FIELDS,BUILD,CONTENT_REVISION} from './providers.mjs';
-import {validateQuestion,buildPrompt,normalizeAnswer,extractAnswer,isUncertainResponse} from './core.mjs';
+import {validateQuestion,buildPrompt,extractAnswer,isUncertainResponse} from './core.mjs';
 
 const clone=v=>structuredClone(v);
 const terminal=r=>['completed','uncertain','error'].includes(r.status);
@@ -10,10 +10,11 @@ async function fingerprint(q) {
   return [...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 export function createController(api) {
-  let providers=defaults(),run=null,tabMap={},calibrations={},metadataQueue=Promise.resolve(),intent=0;
+  let providers=defaults(),run=null,tabMap={},calibrations={},modeDefaultsApplied={},metadataQueue=Promise.resolve(),intent=0;
   const replyVersions=new WeakMap(),readSequences=new WeakMap();
   const ready=(async()=>{
-    const [local,session]=await Promise.all([api.storage.local.get('providers'),api.storage.session.get(['activeTask','run','tabMap','calibrations'])]);
+    const [local,session]=await Promise.all([api.storage.local.get(['providers','modeDefaultsApplied']),api.storage.session.get(['activeTask','run','tabMap','calibrations'])]);
+    modeDefaultsApplied=local.modeDefaultsApplied||{};
     if(local.providers) {try{providers=migrateProviders(local.providers,{addBuiltins:true});if(JSON.stringify(providers)!==JSON.stringify(local.providers))await api.storage.local.set({providers})}catch{ /* Keep valid defaults. */ }}
     tabMap=session.tabMap||{};calibrations=session.calibrations||{};
     const task=Object.hasOwn(session,'activeTask')?session.activeTask:session.run;
@@ -23,7 +24,7 @@ export function createController(api) {
       for(const p of selected){
         const saved=task.results?.[p.id]||{},r=blank(p,task.id,saved.attempt||1);
         if(Number.isInteger(saved.tabId))r.tabId=saved.tabId;
-        if(saved.manualOverride||saved.source==='manual')Object.assign(r,{status:'needs_confirmation',source:'manual',error:'人工答案未缓存，请重新补录。'});
+        if(saved.manualOverride||saved.source==='manual')Object.assign(r,{status:'error',error:'旧版人工答案不再使用，请重试本模型。'});
         else r.status=Number.isInteger(r.tabId)?'generating':'opening';
         if(run.cancelled)Object.assign(r,{status:'error',error:'已停止本题'});
         run.results[p.id]=r;
@@ -42,7 +43,7 @@ export function createController(api) {
   function taskMetadata() {
     if(!run)return null;
     return {id:run.id,questionType:run.questionType,startedAt:run.startedAt,questionHash:run.questionHash,providers:clone(run.providers),cancelled:Boolean(run.cancelled),
-      results:Object.fromEntries(Object.entries(run.results).map(([id,r])=>[id,{providerId:r.providerId,runId:r.runId,attempt:r.attempt,tabId:r.tabId,manualOverride:r.source==='manual'}]))};
+      results:Object.fromEntries(Object.entries(run.results).map(([id,r])=>[id,{providerId:r.providerId,runId:r.runId,attempt:r.attempt,tabId:r.tabId}]))};
   }
   function persistControl() {
     const snapshot={activeTask:taskMetadata(),tabMap:clone(tabMap),calibrations:clone(calibrations)};
@@ -56,7 +57,7 @@ export function createController(api) {
     await Promise.all([publish(),persistControl()]);
   }
   function applyReply(r,reply,fromRead=false) {
-    if(r.source==='manual')return;
+    if(r.source==='confirmed')return;
     const incoming=String(reply.text||'').slice(0,60000);
     const statusOnly=!fromRead&&!incoming&&['sending','generating'].includes(reply.status);
     const text=statusOnly?r.text:incoming;
@@ -75,10 +76,10 @@ export function createController(api) {
   async function refresh() {
     const task=run;if(!task||task.cancelled)return;
     await Promise.allSettled(task.providers.map(async p=>{
-      const r=task.results[p.id];if(!r||r.source==='manual'||!Number.isInteger(r.tabId)||['opening','sending','error'].includes(r.status))return;
+      const r=task.results[p.id];if(!r||r.source==='confirmed'||!Number.isInteger(r.tabId)||['opening','sending','error'].includes(r.status))return;
       const id=task.id,attempt=r.attempt,tabId=r.tabId,version=replyVersions.get(r)||0,sequence=(readSequences.get(r)||0)+1;
       readSequences.set(r,sequence);
-      const valid=()=>run===task&&run.id===id&&!run.cancelled&&run.results[p.id]===r&&r.attempt===attempt&&r.tabId===tabId&&r.source!=='manual'&&(replyVersions.get(r)||0)===version&&readSequences.get(r)===sequence;
+      const valid=()=>run===task&&run.id===id&&!run.cancelled&&run.results[p.id]===r&&r.attempt===attempt&&r.tabId===tabId&&r.source!=='confirmed'&&(replyVersions.get(r)||0)===version&&readSequences.get(r)===sequence;
       const official=tab=>tab.url&&new URL(tab.url).origin===new URL(p.url).origin&&(!tab.pendingUrl||new URL(tab.pendingUrl).origin===new URL(p.url).origin);
       let timer;
       try{
@@ -151,7 +152,7 @@ export function createController(api) {
       if(!valid())return;
       Object.assign(run.results[p.id],{status:'sending',updatedAt:Date.now()});await publish();
       if(!valid())return;
-      const message={type:'site:start',build:BUILD,contentRevision:CONTENT_REVISION,provider:clone(p),question:q,prompt:buildPrompt(q),runId:id,attempt};
+      const message={type:'site:start',build:BUILD,contentRevision:CONTENT_REVISION,provider:clone(p),initializeMode:Boolean(p.defaultMode)&&!modeDefaultsApplied[p.id],question:q,prompt:buildPrompt(q),runId:id,attempt};
       let ack=await api.tabs.sendMessage(tab.id,message);
       if(ack?.resetRequired){
         if(!await resetDraft(p,tab.id,valid))return;
@@ -186,9 +187,13 @@ export function createController(api) {
   async function handle(m={},sender={}){
     try{
       await ready;
+      if(m.type==='site:defaultsApplied'){
+        siteResult(m,sender);modeDefaultsApplied[m.providerId]=true;
+        await api.storage.local.set({modeDefaultsApplied});return {ok:true};
+      }
       if(m.type==='site:update'){
         const r=siteResult(m,sender);
-        if(r.source!=='manual'){
+        if(r.source!=='confirmed'){
           if(!['sending','generating','needs_confirmation','completed','error'].includes(m.status))throw Error('无效页面状态');
           applyReply(r,m);
           await publish();
@@ -208,6 +213,7 @@ export function createController(api) {
       }else if(m.type==='hub:open'){
         await dedicated(provider(m.providerId),true);await publishControl();
       }else if(m.type==='hub:start'){
+        if(m.manualOnly)throw Error('此版本不支持人工汇总，请使用一键发送');
         const errors=validateQuestion(m.question);if(errors.length)throw Error(errors.join('；'));
         const selected=providers.filter(p=>p.enabled&&(!m.providerIds||m.providerIds.includes(p.id)));
         if(!selected.length)throw Error('至少启用一个模型');
@@ -215,9 +221,8 @@ export function createController(api) {
         if(run)run.cancelled=true;
         await cancelSites(run,()=>ticket===intent);if(ticket!==intent)throw Error('此请求已取消');
         const id=crypto.randomUUID();run={id,questionType:m.question.type,startedAt:Date.now(),questionHash:hash,providers:clone(selected),results:Object.fromEntries(selected.map(p=>[p.id,blank(p,id)]))};
-        if(m.manualOnly)for(const r of Object.values(run.results))r.status='idle';
         await publishControl();
-        if(!m.manualOnly)await Promise.allSettled(selected.map(p=>dispatch(p,m.question,id,1)));
+        await Promise.allSettled(selected.map(p=>dispatch(p,m.question,id,1)));
       }else if(m.type==='hub:retry'){
         if(!run||run.cancelled)throw Error('请先开始一题');
         const errors=validateQuestion(m.question);if(errors.length)throw Error(errors.join('；'));
@@ -229,13 +234,13 @@ export function createController(api) {
         const attempt=old.attempt+1;run.results[p.id]=blank(p,id,attempt);await publishControl();
         await cancelSites({providers:[p],results:{[p.id]:old}},()=>current(id,attempt,p.id));
         await dispatch(p,m.question,id,attempt);
-      }else if(m.type==='hub:manual'||m.type==='hub:confirm'){
+      }else if(m.type==='hub:confirm'){
         const r=run?.results[m.providerId];if(!r)throw Error('请先开始一题');
-        if(m.type==='hub:confirm'&&(r.status==='uncertain'||isUncertainResponse(r.text)))throw Error('模型已明确无法确认，请重试或核对后人工补录答案');
-        const answer=m.type==='hub:manual'?normalizeAnswer(m.answer,run.questionType):extractAnswer(r.text,run.questionType);
-        if(!answer)throw Error('未找到明确答案，请手动填写完整答案');
-        if(m.type==='hub:confirm'&&r.status!=='needs_confirmation')throw Error('请等待回复结束后再确认');
-        Object.assign(r,{status:'completed',answer,error:'',readDelayed:false,source:'manual',updatedAt:Date.now()});await publishControl();
+        if(r.status==='uncertain'||isUncertainResponse(r.text))throw Error('模型已明确无法确认，请重试本模型');
+        const answer=extractAnswer(r.text,run.questionType);
+        if(!answer)throw Error('未找到明确答案，请重试本模型');
+        if(r.status!=='needs_confirmation')throw Error('请等待回复结束后再确认');
+        Object.assign(r,{status:'completed',answer,error:'',readDelayed:false,source:'confirmed',updatedAt:Date.now()});await publishControl();
       }else if(m.type==='hub:cancel'||m.type==='hub:clear'){
         const ticket=++intent,oldRun=run;if(oldRun){oldRun.cancelled=true;for(const r of Object.values(oldRun.results))if(!terminal(r))Object.assign(r,{status:'error',error:'已停止本题',answer:null})}
         if(m.type==='hub:clear')run=null;await publishControl();await cancelSites(oldRun,()=>ticket===intent);
