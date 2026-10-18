@@ -102,7 +102,7 @@ function Update-BingdaInstallation([string]$Root,$Metadata,[string]$ArchivePath)
         $files.Add($name)
       }
     }finally{$zip.Dispose()}
-    $required=@('LICENSE','安装说明.txt','更新并答.cmd','update.ps1','extension/content.js','extension/controller.mjs','extension/core.mjs','extension/dashboard.css','extension/dashboard.html','extension/dashboard.mjs','extension/help.html','extension/manifest.json','extension/providers.mjs','extension/worker.mjs')
+    $required=@('LICENSE','安装说明.txt','更新并答.cmd','update.ps1','extension/content.js','extension/controller.mjs','extension/core.mjs','extension/dashboard.css','extension/dashboard.html','extension/dashboard.mjs','extension/help.html','extension/manifest.json','extension/page-bridge.js','extension/providers.mjs','extension/worker.mjs')
     foreach($name in $required){if(-not $seen.Contains($name)){throw ('更新包缺少必要文件：'+$name)}}
     $newManifest=Get-Content -LiteralPath (Join-Path $payload 'extension/manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     if($newManifest.name -ne '并答 · 多模型答题助手' -or $newManifest.version -ne $Metadata.version -or $newManifest.manifest_version -ne 3){throw '安装包版本与线上更新版本不一致。'}
