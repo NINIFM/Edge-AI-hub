@@ -3,66 +3,115 @@ import {validateQuestion,buildPrompt,extractAnswer,isUncertainResponse} from './
 
 const clone=v=>structuredClone(v);
 const terminal=r=>['completed','uncertain','error'].includes(r.status);
+const needsPolling=r=>!terminal(r)&&!r.replyFinished;
+const submissionsSettled=task=>task&&!task.cancelled&&Object.values(task.results).every(r=>r.submitted||terminal(r));
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function conversationKey(id,value){
+  const url=new URL(value);
+  if(id==='glm')return url.searchParams.get('cid');
+  const routes={deepseek:/^\/a\/chat\/s\/([^/]+)\/?$/,qwen:/^\/chat\/([^/]+)\/?$/,step:/^\/chats\/(?!new\/?$)([^/]+)\/?$/,hunyuan:/^\/chat\/([^/]+\/[^/]+)\/?$/};
+  return routes[id]?url.pathname.match(routes[id])?.[1]??null:url.origin+url.pathname+url.search;
+}
 async function fingerprint(q) {
   const value=JSON.stringify([q.type,q.text,q.images.map(i=>[i.mime,i.dataUrl])]);
   const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value));
   return [...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 export function createController(api) {
-  let providers=defaults(),run=null,tabMap={},calibrations={},modeDefaultsApplied={},metadataQueue=Promise.resolve(),intent=0;
+  let providers=defaults(),run=null,tabMap={},calibrations={},promptContexts={},metadataQueue=Promise.resolve(),intent=0,answerPoll=null,polling=false,modelWindowId=null,windowOpening=null,refreshPending=null;
   const replyVersions=new WeakMap(),readSequences=new WeakMap();
   const ready=(async()=>{
-    const [local,session]=await Promise.all([api.storage.local.get(['providers','modeDefaultsApplied']),api.storage.session.get(['activeTask','run','tabMap','calibrations'])]);
-    modeDefaultsApplied=local.modeDefaultsApplied||{};
+    const [local,session]=await Promise.all([api.storage.local.get(['providers']),api.storage.session.get(['activeTask','run','tabMap','calibrations','modelWindowId','promptContexts'])]);
     if(local.providers) {try{providers=migrateProviders(local.providers,{addBuiltins:true});if(JSON.stringify(providers)!==JSON.stringify(local.providers))await api.storage.local.set({providers})}catch{ /* Keep valid defaults. */ }}
-    tabMap=session.tabMap||{};calibrations=session.calibrations||{};
+    tabMap=session.tabMap||{};calibrations=session.calibrations||{};modelWindowId=session.modelWindowId??null;promptContexts=session.promptContexts||{};
     const task=Object.hasOwn(session,'activeTask')?session.activeTask:session.run;
     if(task?.providers){
       const selected=migrateProviders(task.providers);
       run={id:task.id,questionType:task.questionType,startedAt:task.startedAt,questionHash:task.questionHash,providers:selected,cancelled:Boolean(task.cancelled),results:{}};
       for(const p of selected){
         const saved=task.results?.[p.id]||{},r=blank(p,task.id,saved.attempt||1);
+        r.includesInstructions=saved.includesInstructions===true;
         if(Number.isInteger(saved.tabId))r.tabId=saved.tabId;
         if(saved.manualOverride||saved.source==='manual')Object.assign(r,{status:'error',error:'旧版人工答案不再使用，请重试本模型。'});
-        else r.status=Number.isInteger(r.tabId)?'generating':'opening';
+        else Object.assign(r,Number.isInteger(r.tabId)?{status:'sending'}:{status:'error',error:'上次发题流程已中断，请重试本模型。'});
         if(run.cancelled)Object.assign(r,{status:'error',error:'已停止本题'});
         run.results[p.id]=r;
       }
+      if(!run.cancelled)await recoverSubmissions();
     }
     if(Object.hasOwn(session,'run')){
       await persistControl();
       await api.storage.session.remove('run');
     }
+    syncPolling();
   })();
+  async function recoverSubmissions(){
+    await Promise.allSettled(run.providers.map(async p=>{
+      const r=run.results[p.id];if(terminal(r))return;let timer;
+      try{
+        const tab=await api.tabs.get(r.tabId);
+        if(!tab?.url||new URL(tab.url).origin!==new URL(p.url).origin||(tab.pendingUrl&&new URL(tab.pendingUrl).origin!==new URL(p.url).origin))throw Error('模型网页已失效');
+        const reply=await Promise.race([api.tabs.sendMessage(r.tabId,{type:'site:status',providerId:p.id,runId:run.id,attempt:r.attempt}),new Promise((resolve,reject)=>{timer=setTimeout(()=>reject(Error('发题状态读取超时')),3000)})]);
+        if(!reply?.ok||typeof reply.submitted!=='boolean')throw Error('网页发题任务已失效');
+        r.submitted=reply.submitted;
+        if(r.submitted){recordInstructions(r,tab.url);await persistControl();}
+        if(reply.status==='error')Object.assign(r,{status:'error',error:String(reply.error||'上次发题失败，请重试本模型。')});
+        else if(reply.done&&r.submitted)applyReply(r,reply,true);
+        else r.status=r.submitted?'generating':'sending';
+      }catch(error){Object.assign(r,{status:'error',error:(error.message||'发题状态恢复失败')+'，请重试本模型。'})}
+      finally{clearTimeout(timer)}
+    }));
+  }
   const state=()=>{
     const view=clone({providers,run,build:BUILD});
-    for(const result of Object.values(view.run?.results||{}))delete result.text;
+    if(view.run)view.run.phase=run.cancelled||!Object.values(run.results).some(needsPolling)?'finished':submissionsSettled(run)?'collecting':'sending';
     return view;
   };
   function taskMetadata() {
     if(!run)return null;
     return {id:run.id,questionType:run.questionType,startedAt:run.startedAt,questionHash:run.questionHash,providers:clone(run.providers),cancelled:Boolean(run.cancelled),
-      results:Object.fromEntries(Object.entries(run.results).map(([id,r])=>[id,{providerId:r.providerId,runId:r.runId,attempt:r.attempt,tabId:r.tabId}]))};
+      results:Object.fromEntries(Object.entries(run.results).map(([id,r])=>[id,{providerId:r.providerId,runId:r.runId,attempt:r.attempt,tabId:r.tabId,includesInstructions:r.includesInstructions}]))};
   }
   function persistControl() {
-    const snapshot={activeTask:taskMetadata(),tabMap:clone(tabMap),calibrations:clone(calibrations)};
+    const snapshot={activeTask:taskMetadata(),tabMap:clone(tabMap),calibrations:clone(calibrations),modelWindowId,promptContexts:clone(promptContexts)};
     metadataQueue=metadataQueue.catch(()=>{}).then(()=>api.storage.session.set(snapshot));
     return metadataQueue;
   }
   async function publish() {
+    syncPolling();
     try{await api.runtime.sendMessage({type:'hub:state',state:state()})}catch{ /* No dashboard open. */ }
+  }
+  function syncPolling() {
+    const pending=submissionsSettled(run)&&Object.values(run.results).some(needsPolling);
+    if(pending&&!answerPoll){
+      answerPoll=setInterval(async()=>{
+        if(polling)return;
+        polling=true;
+        try{await refresh()}finally{polling=false}
+      },1500);
+      answerPoll.unref?.();
+    }else if(!pending&&answerPoll){clearInterval(answerPoll);answerPoll=null}
   }
   async function publishControl() {
     await Promise.all([publish(),persistControl()]);
   }
+  function needsInstructions(p,tab){
+    const saved=promptContexts[p.id],key=conversationKey(p.id,tab.url);
+    if(saved?.tabId!==tab.id||!key||(saved.key!==null&&saved.key!==key))return true;
+    saved.key=key;return false;
+  }
+  function recordInstructions(r,url){
+    if(r.includesInstructions)promptContexts[r.providerId]={tabId:r.tabId,key:conversationKey(r.providerId,url)};
+  }
   function applyReply(r,reply,fromRead=false) {
-    if(r.source==='confirmed')return;
+    if(r.source==='confirmed'||!needsPolling(r))return;
+    if(r.submitted&&reply.status==='sending')return;
+    if(!fromRead&&['generating','needs_confirmation','completed'].includes(reply.status))r.submitted=true;
     const incoming=String(reply.text||'').slice(0,60000);
     const statusOnly=!fromRead&&!incoming&&['sending','generating'].includes(reply.status);
     const text=statusOnly?r.text:incoming;
     const uncertain=isUncertainResponse(text),answer=reply.ambiguous?null:extractAnswer(text,run.questionType);
-    const done=fromRead?reply.done===true&&!reply.stopped:reply.status==='completed';
+    const done=fromRead?reply.done===true&&!reply.stopped&&!reply.ambiguous:reply.status==='completed';
     let status,error=String(reply.error||'').slice(0,1000);
     if(reply.status==='error')status='error';
     else if(done)status=uncertain?'uncertain':answer?'completed':'needs_confirmation';
@@ -70,22 +119,29 @@ export function createController(api) {
     else if(fromRead)status=reply.stopped?'generating':reply.ambiguous||reply.status==='needs_confirmation'?'needs_confirmation':'generating';
     else status=reply.status;
     if(reply.ambiguous&&!error)error='本题回复匹配不明确，请打开模型网页核对。';
-    Object.assign(r,{status,text,answer:status==='error'||uncertain?null:answer,error,readDelayed:false,updatedAt:Date.now()});
+    Object.assign(r,{status,text,answer:status==='error'||uncertain?null:answer,error,replyFinished:done,readDelayed:false,updatedAt:Date.now()});
     replyVersions.set(r,(replyVersions.get(r)||0)+1);
   }
-  async function refresh() {
-    const task=run;if(!task||task.cancelled)return;
-    await Promise.allSettled(task.providers.map(async p=>{
-      const r=task.results[p.id];if(!r||r.source==='confirmed'||!Number.isInteger(r.tabId)||['opening','sending','error'].includes(r.status))return;
+  function refresh() {
+    if(!refreshPending)refreshPending=refreshAnswers().finally(()=>{refreshPending=null});
+    return refreshPending;
+  }
+  async function refreshAnswers() {
+    const task=run;if(!submissionsSettled(task))return;
+    const readProvider=async p=>{
+      const r=task.results[p.id];if(!submissionsSettled(task)||!r||!needsPolling(r)||r.source==='confirmed'||!Number.isInteger(r.tabId))return;
       const id=task.id,attempt=r.attempt,tabId=r.tabId,version=replyVersions.get(r)||0,sequence=(readSequences.get(r)||0)+1;
       readSequences.set(r,sequence);
-      const valid=()=>run===task&&run.id===id&&!run.cancelled&&run.results[p.id]===r&&r.attempt===attempt&&r.tabId===tabId&&r.source!=='confirmed'&&(replyVersions.get(r)||0)===version&&readSequences.get(r)===sequence;
+      const valid=()=>run===task&&run.id===id&&submissionsSettled(task)&&run.results[p.id]===r&&needsPolling(r)&&r.attempt===attempt&&r.tabId===tabId&&r.source!=='confirmed'&&(replyVersions.get(r)||0)===version&&readSequences.get(r)===sequence;
       const official=tab=>tab.url&&new URL(tab.url).origin===new URL(p.url).origin&&(!tab.pendingUrl||new URL(tab.pendingUrl).origin===new URL(p.url).origin);
       let timer;
       try{
         const reading=(async()=>{
           const tab=await api.tabs.get(tabId);if(!valid())return;
           if(!official(tab))throw Error('模型页面已离开授权域名，请打开网页检查。');
+          if(tab.windowId===modelWindowId){
+            await api.tabs.update(tabId,{active:true});await sleep(120);if(!valid())return;
+          }
           const reply=await api.tabs.sendMessage(tabId,{type:'site:read',providerId:p.id,runId:id,attempt});
           if(!valid())return;
           const latestTab=await api.tabs.get(tabId);if(!valid())return;
@@ -110,32 +166,56 @@ export function createController(api) {
       }
       // Publish each model as soon as it returns; another tab may be asleep or unresponsive.
       if(run===task&&!task.cancelled)await publish();
-    }));
+    };
+    for(const p of task.providers)await readProvider(p);
   }
-  const current=(id,attempt,pid)=>run?.id===id && run.results[pid]?.attempt===attempt && !run.cancelled && !terminal(run.results[pid]);
+  const current=(id,attempt,pid)=>run?.id===id && run.results[pid]?.attempt===attempt && !run.cancelled && needsPolling(run.results[pid]);
   function provider(id){const p=providers.find(p=>p.id===id);if(!p)throw Error('找不到此模型');return p}
   async function permitted(p){if(!await api.permissions.contains({origins:[originPattern(p.url)]}))throw Error('请在模型设置中授权该 AI 网站，然后重试')}
+  async function modelWindow(p){
+    if(!windowOpening)windowOpening=(async()=>{
+      if(modelWindowId!==null){try{return await api.windows.get(modelWindowId)}catch{modelWindowId=null}}
+      const created=await api.windows.create({url:p.url,type:'normal',focused:false,width:1000,height:720});
+      modelWindowId=created.id;
+      if(created.tabs?.[0])tabMap[p.id]=created.tabs[0].id;
+      return created;
+    })().finally(()=>{windowOpening=null});
+    return windowOpening;
+  }
   async function dedicated(p,active=false,valid=()=>true){
     await permitted(p);
     let tab;try{if(tabMap[p.id])tab=await api.tabs.get(tabMap[p.id])}catch{}
     // A user may have navigated our tab elsewhere. Never replace that page.
-    if(tab && (!tab.url || new URL(tab.url).origin!==new URL(p.url).origin || (tab.pendingUrl && new URL(tab.pendingUrl).origin!==new URL(p.url).origin)))tab=null;
+    if(tab && (!tab.url || new URL(tab.url).origin!==new URL(p.url).origin || (tab.pendingUrl && new URL(tab.pendingUrl).origin!==new URL(p.url).origin))){delete tabMap[p.id];tab=null;}
     if(!valid())throw Error('本次操作已取消');
-    if(!tab)tab=await api.tabs.create({url:p.url,active});
-    else if(active)tab=await api.tabs.update(tab.id,{active:true});
+    const window=await modelWindow(p);if(!valid())throw Error('本次操作已取消');
+    if(!tab){
+      if(tabMap[p.id]){try{tab=await api.tabs.get(tabMap[p.id])}catch{}}
+      if(!tab)tab=await api.tabs.create({url:p.url,active:false,windowId:window.id});
+    }
+    if(tab.windowId!==window.id)tab=await api.tabs.move(tab.id,{windowId:window.id,index:-1});
+    if(active){await api.tabs.update(tab.id,{active:true});await api.windows.update(window.id,{focused:true})}
+    await api.tabs.update(tab.id,{autoDiscardable:false});
     tabMap[p.id]=tab.id;return tab;
   }
   async function inject(p,tabId,valid=()=>true){
     const end=Date.now()+30000;
+    let reloaded=false;
     while(Date.now()<end){
       if(!valid())throw Error('该次发送已取消');
       const tab=await api.tabs.get(tabId);
       if(tab.url && new URL(tab.url).origin!==new URL(p.url).origin)throw Error('AI 页面跳转到了其他域名，请检查登录状态');
       if(tab.status==='complete'){
+        await api.scripting.executeScript({target:{tabId},files:['page-bridge.js'],world:'MAIN'});
         await api.scripting.executeScript({target:{tabId},files:['content.js']});
         if(!valid())throw Error('该次发送已取消');
         const ack=await api.tabs.sendMessage(tabId,{type:'site:ping'});
-        if(ack?.ok){if(ack.build!==BUILD||ack.contentRevision!==CONTENT_REVISION)throw Error('页面适配版本未更新，请刷新模型网页后再发送');return;}
+        if(ack?.ok){
+          if(ack.build===BUILD&&ack.contentRevision===CONTENT_REVISION)return;
+          if(reloaded)throw Error('模型网页适配更新未生效，请重试本模型');
+          if(!await resetDraft(p,tabId,valid))return;
+          reloaded=true;await sleep(250);continue;
+        }
       }
       await sleep(250);
     }
@@ -150,9 +230,11 @@ export function createController(api) {
       run.results[p.id].tabId=tab.id;await publishControl();
       await inject(p,tab.id,valid);
       if(!valid())return;
-      Object.assign(run.results[p.id],{status:'sending',updatedAt:Date.now()});await publish();
+      const latestTab=await api.tabs.get(tab.id);if(!valid())return;
+      const includesInstructions=needsInstructions(p,latestTab);
+      Object.assign(run.results[p.id],{status:'sending',includesInstructions,updatedAt:Date.now()});await publishControl();
       if(!valid())return;
-      const message={type:'site:start',build:BUILD,contentRevision:CONTENT_REVISION,provider:clone(p),initializeMode:Boolean(p.defaultMode)&&!modeDefaultsApplied[p.id],question:q,prompt:buildPrompt(q),runId:id,attempt};
+      const message={type:'site:start',build:BUILD,contentRevision:CONTENT_REVISION,provider:clone(p),question:q,prompt:buildPrompt(q,{includeInstructions:includesInstructions}),runId:id,attempt};
       let ack=await api.tabs.sendMessage(tab.id,message);
       if(ack?.resetRequired){
         if(!await resetDraft(p,tab.id,valid))return;
@@ -177,7 +259,7 @@ export function createController(api) {
       if(ack?.resetRequired&&p&&valid())await resetDraft(p,r.tabId,valid);
     }));
   }
-  function blank(p,id,attempt=1){return {providerId:p.id,runId:id,attempt,status:'opening',text:'',answer:null,error:'',source:'auto',updatedAt:Date.now()}}
+  function blank(p,id,attempt=1){return {providerId:p.id,runId:id,attempt,status:'opening',submitted:false,includesInstructions:false,replyFinished:false,text:'',answer:null,error:'',source:'auto',updatedAt:Date.now()}}
   function siteResult(m,sender){
     const r=run?.results[m.providerId],p=run?.providers.find(p=>p.id===m.providerId);
     if(!r||!p||run.cancelled||m.runId!==run.id||m.attempt!==r.attempt||sender.tab?.id!==r.tabId||sender.frameId>0)throw Error('已忽略不匹配的页面消息');
@@ -187,15 +269,12 @@ export function createController(api) {
   async function handle(m={},sender={}){
     try{
       await ready;
-      if(m.type==='site:defaultsApplied'){
-        siteResult(m,sender);modeDefaultsApplied[m.providerId]=true;
-        await api.storage.local.set({modeDefaultsApplied});return {ok:true};
-      }
       if(m.type==='site:update'){
         const r=siteResult(m,sender);
         if(r.source!=='confirmed'){
           if(!['sending','generating','needs_confirmation','completed','error'].includes(m.status))throw Error('无效页面状态');
-          applyReply(r,m);
+          const wasSubmitted=r.submitted;applyReply(r,m);
+          if(!wasSubmitted&&r.submitted){recordInstructions(r,sender.url);await persistControl();}
           await publish();
         }
         return {ok:true};

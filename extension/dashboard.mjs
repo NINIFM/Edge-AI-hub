@@ -5,19 +5,17 @@ const IMAGE_TYPES=new Set(['image/png','image/jpeg','image/webp','image/gif']);
 const STATUSES={idle:'等待回答',opening:'正在打开网页',sending:'正在发送',generating:'正在生成',needs_confirmation:'请查看网页',completed:'已完成',uncertain:'无法确认',error:'出现异常'};
 const SELECTORS={input:'输入框',send:'发送按钮',response:'回答内容',responseRoot:'单轮回答容器',stop:'停止生成按钮',attachment:'已上传附件',done:'明确完成标记'};
 const PREVIEW_PROVIDERS=defaults();
-export function imageBatchErrors(existing,files){
+export function imageBatchErrors(files){
   const errors=[];
-  if(existing.length+files.length>4)errors.push('每题最多添加 4 张图片。');
+  if(files.length>1)errors.push('每题只添加 1 张图片，重新粘贴可替换原图。');
   if(files.some(f=>!IMAGE_TYPES.has(f.type)))errors.push('仅支持 PNG、JPEG、WEBP 或 GIF 原图。');
   if(files.some(f=>!Number.isSafeInteger(f.size)||f.size<=0||f.size>8*MIB))errors.push('单张图片大小必须大于 0 且不超过 8 MiB。');
-  if([...existing,...files].reduce((sum,f)=>sum+f.size,0)>20*MIB)errors.push('图片总大小不能超过 20 MiB。');
   return errors;
 }
 export function recommendationView(outcome){
-  const titles={majority:'完整答案已达成多数',fallback:'无多数，参考 GLM',pending:'等待完整答案',incomplete:'本题结果不完整',no_voters:'没有参与投票的模型'};
-  const valid=outcome.status==='majority'||outcome.status==='fallback';
-  const provisional=!valid&&outcome.provisionalAnswer?` GLM 已完成答案：${outcome.provisionalAnswer}，仅供参考。`:'';
-  return {title:titles[outcome.status]??'等待开始',reason:(outcome.reason??'')+provisional,answer:valid?outcome.answer:null,status:outcome.status};
+  const titles={pending:'等待答案',incomplete:'暂无有效答案',no_voters:'未启用投票模型'};
+  const valid=outcome.status==='plurality'||outcome.status==='tie';
+  return {title:valid?`最高票 · ${outcome.votes} 票${outcome.status==='tie'?'（并列）':''}`:titles[outcome.status]??'等待开始',answer:valid?outcome.leaders.map(leader=>leader.answer).join(' / '):null,status:outcome.status};
 }
 function customOrigin(provider){
   let url;try{url=new URL(provider.url);}catch{throw Error('请填写有效的 HTTPS 网站地址。');}
@@ -37,7 +35,7 @@ function safeColor(color){return /^#[0-9a-f]{6}$/i.test(color)?color:'#168779';}
 export class Dashboard{
   constructor(document,api=globalThis.chrome??{}){
     this.document=document;this.api=api;this.preview=!api.runtime?.sendMessage;this.state={providers:[],run:null};
-    this.images=[];this.questionType='auto';this.sentQuestion=null;this.cards=new Map();this.settingsDraft=[];this.imageLoading=false;this.starting=false;this.readingAnswers=false;
+    this.images=[];this.sentQuestion=null;this.cards=new Map();this.settingsDraft=[];this.imageLoading=false;this.starting=false;this.readingAnswers=false;this.editorGeneration=0;
   }
   $(id){return this.document.getElementById(id);}
   feedback(message,error=true){const el=this.$('feedback');el.textContent=message;el.hidden=!message;el.className=error?'feedback error':'feedback';}
@@ -47,14 +45,11 @@ export class Dashboard{
     else{
       this.api.runtime.onMessage?.addListener(message=>{if(message?.type==='hub:state'&&message.state)this.setState(message.state);});
       await this.command('hub:get');
-      const answerPoll=setInterval(()=>this.readAnswers(),1000);
       this.document.addEventListener('visibilitychange',()=>{if(!this.document.hidden)this.readAnswers();});
-      this.document.defaultView?.addEventListener('pagehide',()=>clearInterval(answerPoll),{once:true});
     }
     this.render();
   }
   bind(){
-    this.$('type-group').querySelectorAll('button').forEach(el=>el.addEventListener('click',()=>{if(this.state.run)return;this.questionType=el.dataset.type;this.renderEditor();}));
     this.$('question-text').closest('.composer').addEventListener('paste',event=>{
       if(this.state.run||this.imageLoading)return;
       const files=[...(event.clipboardData?.items??[])].filter(item=>item.kind==='file'&&item.type.startsWith('image/')).map(item=>item.getAsFile()).filter(Boolean);
@@ -71,14 +66,15 @@ export class Dashboard{
   updateExtension(){
     if(this.starting||this.imageLoading){this.feedback('请等待当前操作完成，再更新扩展。');return;}
     if(this.state.run&&!this.state.run.cancelled){this.feedback('请先点击“清空 / 下一题”结束本题，再更新扩展。');return;}
-    this.feedback('正在启动本地更新工具。首次使用请先双击安装目录中的“更新并答.cmd”。更新完成后，在 Edge 重新加载并答，再刷新面板和模型网页。',false);
+    this.feedback('正在启动本地更新工具。首次使用请先双击安装目录中的“更新并答.cmd”。更新完成后，在 Edge 重新加载并答，再刷新面板。',false);
     try{this.document.defaultView.location.assign('bingda-ai-update://run/');}catch{this.feedback('无法启动更新工具，请先双击安装目录中的“更新并答.cmd”。');}
   }
-  setState(state){if(!state||!Array.isArray(state.providers))return;if(state.run?.id!==this.state.run?.id)this.sentQuestion=null;if(['auto','single','multiple','judgment'].includes(state.run?.questionType))this.questionType=state.run.questionType;this.state=state;this.$('build-version').textContent=this.preview?`界面预览 ${BUILD}`:state.build===BUILD?`版本${BUILD}`:'后台未更新，请刷新扩展';this.render();}
+  setState(state){if(!state||!Array.isArray(state.providers))return;if(state.run?.id!==this.state.run?.id)this.sentQuestion=null;this.state=state;this.$('build-version').textContent=this.preview?`界面预览 ${BUILD}`:state.build===BUILD?`版本${BUILD}`:'后台未更新，请刷新扩展';this.render();}
   async command(type,payload={}){
     if(this.preview)return this.previewCommand(type,payload);
-    try{const response=await this.api.runtime.sendMessage({type,...payload});if(!response?.ok)throw Error(response?.error??'扩展没有返回有效响应。');if(response.state)this.setState(response.state);return response;}
-    catch(error){this.feedback(error.message??'操作失败，请重新打开扩展。');return {ok:false,error:error.message};}
+    const generation=this.editorGeneration;
+    try{const response=await this.api.runtime.sendMessage({type,...payload});if(generation!==this.editorGeneration)return {ok:false,cancelled:true};if(!response?.ok)throw Error(response?.error??'扩展没有返回有效响应。');if(response.state&&type!=='hub:clear')this.setState(response.state);return response;}
+    catch(error){if(generation===this.editorGeneration)this.feedback(error.message??'操作失败，请重新打开扩展。');return {ok:false,error:error.message};}
   }
   async readAnswers(){
     if(this.preview||this.readingAnswers||!this.state.run||this.state.run.cancelled)return;
@@ -93,22 +89,24 @@ export class Dashboard{
   }
   async addImages(files){
     if(this.state.run||this.imageLoading){this.feedback('请先点击“清空 / 下一题”再添加图片。');return;}if(!files.length)return;
-    const errors=imageBatchErrors(this.images,files);if(errors.length){this.feedback(errors.join(' '));return;}
-    this.imageLoading=true;this.renderEditor();
+    const errors=imageBatchErrors(files);if(errors.length){this.feedback(errors.join(' '));return;}
+    const generation=this.editorGeneration;this.imageLoading=true;this.renderEditor();
     try{
       const images=await Promise.all(files.map(file=>new Promise((resolve,reject)=>{
         const reader=new this.document.defaultView.FileReader();reader.onload=()=>resolve({name:file.name||'粘贴截图.png',mime:file.type,size:file.size,dataUrl:reader.result});reader.onerror=()=>reject(Error('图片读取失败，请重新复制并粘贴截图。'));reader.readAsDataURL(file);
       })));
-      const next={text:this.$('question-text').value,type:this.questionType,images:[...this.images,...images]};const validation=validateQuestion(next);if(validation.length)throw Error(validation.join(' '));
+      if(generation!==this.editorGeneration)return;
+      const next={text:this.$('question-text').value,type:'auto',images};const validation=validateQuestion(next);if(validation.length)throw Error(validation.join(' '));
       this.images=next.images;this.renderImages();this.feedback('',false);
-    }catch(error){this.feedback(error.message);}finally{this.imageLoading=false;this.renderEditor();}
+    }catch(error){if(generation===this.editorGeneration)this.feedback(error.message);}finally{if(generation===this.editorGeneration){this.imageLoading=false;this.renderEditor();}}
   }
   async start(){
     if(this.state.run||this.starting||this.imageLoading)return;if(this.preview){this.feedback('请在 Edge 中加载扩展后发送题目。');return;}
-    const question={text:this.$('question-text').value.trim(),type:this.questionType,images:this.images.map(image=>({...image}))};
+    const question={text:this.$('question-text').value.trim(),type:'auto',images:this.images.map(image=>({...image}))};
     const errors=validateQuestion(question);if(errors.length){this.feedback(errors.join(' '));return;}
     const providerIds=this.state.providers.filter(p=>p.enabled).map(p=>p.id);if(!providerIds.length){this.feedback('请先在模型设置中启用至少一个模型。');return;}
-    this.starting=true;this.renderEditor();const response=await this.command('hub:start',{question,providerIds});
+    const generation=this.editorGeneration;this.starting=true;this.renderEditor();const response=await this.command('hub:start',{question,providerIds});
+    if(generation!==this.editorGeneration)return;
     if(response.ok){this.sentQuestion=question;this.feedback('已派发题目，请关注各模型的独立状态。',false);}
     this.starting=false;this.renderEditor();this.renderCards();
   }
@@ -116,13 +114,12 @@ export class Dashboard{
     if(!this.sentQuestion){this.feedback('本题原始题目和图片不在当前面板内存中，请点击“清空 / 下一题”重新添加后发送。');return;}
     await this.command('hub:retry',{providerId,question:{...this.sentQuestion,images:this.sentQuestion.images.map(image=>({...image}))}});
   }
-  async clear(){if(this.imageLoading||this.starting)return;const response=await this.command('hub:clear');if(response.ok){this.sentQuestion=null;this.images=[];this.$('question-text').value='';this.renderImages();this.feedback('',false);this.render();this.$('question-text').focus();}}
+  async clear(){this.editorGeneration++;this.sentQuestion=null;this.images=[];this.imageLoading=false;this.starting=false;this.state.run=null;this.$('question-text').value='';this.renderImages();this.feedback('',false);this.render();this.$('question-text').focus();await this.command('hub:clear');}
   render(){this.renderEditor();this.renderCards();this.renderRecommendation();}
   renderEditor(){
     const locked=Boolean(this.state.run)||this.starting||this.imageLoading;this.$('question-text').disabled=locked;
-    this.$('type-group').querySelectorAll('button').forEach(el=>{el.disabled=locked;el.setAttribute('aria-pressed',String(el.dataset.type===(this.state.run?.questionType??this.questionType)));});
     this.$('start-question').disabled=locked||this.preview;
-    this.$('settings-open').disabled=Boolean(this.state.run)||this.starting;this.$('clear-question').disabled=this.imageLoading||this.starting;
+    this.$('settings-open').disabled=Boolean(this.state.run)||this.starting;this.$('clear-question').disabled=false;
     this.$('pastezone').classList.toggle('locked',locked);this.$('pastezone').setAttribute('aria-disabled',String(locked));this.$('image-previews').querySelectorAll('button').forEach(el=>el.disabled=locked);
     this.$('composer-hint').textContent=this.imageLoading?'正在读取原图…':this.state.run?'清空会停止本题，下一题继续使用原会话。':this.preview?'界面预览：请在 Edge 加载扩展后发送。':'各模型在原会话连续答题；截图直接 Ctrl+V。';
     this.$('cancel-run').hidden=this.preview||!Object.values(this.state.run?.results??{}).some(r=>['opening','sending','generating'].includes(r.status));
@@ -145,7 +142,8 @@ export class Dashboard{
     const actions=node(d,'div','card-actions');
     actions.append(button(d,'打开网页 ↗','text-button open-provider',()=>this.command('hub:open',{providerId:provider.id})),button(d,'重试本模型','text-button retry-provider',()=>this.retry(provider.id)),button(d,'确认网页已完成','button secondary confirm-provider',()=>this.command('hub:confirm',{providerId:provider.id})));
     const mode=node(d,'p','provider-mode');
-    card.append(heading,mode,meta,answer,note,error,actions);return card;
+    const reply=node(d,'div','provider-reply');reply.append(node(d,'p','reply-text'));
+    card.append(heading,mode,meta,answer,note,error,reply,actions);return card;
   }
   renderCards(){
     const run=this.state.run;const providers=this.state.providers;const ids=new Set(providers.map(p=>p.id));
@@ -157,13 +155,18 @@ export class Dashboard{
       const status=enabled?(result?.status??'idle'):'disabled';
       const valid=['generating','needs_confirmation','completed'].includes(status)?normalizeAnswer(result?.answer,run?.questionType):null;
       const captured=status==='generating'&&Boolean(valid);
-      const statusElement=card.querySelector('.provider-status');statusElement.textContent=enabled?(result?.readDelayed?'读取延迟':captured?'已捕获答案':STATUSES[status]??'状态未知'):'未启用';statusElement.dataset.status=captured?'captured':status;
-      const mode=card.querySelector('.provider-mode');mode.hidden=!provider.defaultMode;mode.textContent=provider.defaultMode?`初始：${provider.defaultMode} · 原网页可调整`:'';
+      const showReply=Boolean(enabled&&!valid&&result?.text&&(result.replyFinished||['needs_confirmation','completed','uncertain','error'].includes(status)));
+      const waiting=run?.phase==='sending'&&result?.submitted&&!result?.replyFinished&&status==='generating';
+      const statusElement=card.querySelector('.provider-status');statusElement.textContent=enabled?(waiting?'已发送':result?.replyFinished&&status==='needs_confirmation'?'回复已结束':result?.readDelayed?'读取延迟':captured?'已捕获答案':STATUSES[status]??'状态未知'):'未启用';statusElement.dataset.status=captured?'captured':status;
+      card.querySelector('.provider-mode').textContent='使用网页当前模型与设置';
       card.querySelector('.vote-label').textContent=provider.voting?'参与投票':'仅供参考';card.querySelector('.source-label').textContent=result?.source==='confirmed'?'网页完成确认':result?.source==='auto'&&valid?'网页直接捕获':'使用官方网页';
-      const note=card.querySelector('.result-note');note.hidden=status==='completed';
-      note.textContent=!enabled?'在模型设置中启用后即可使用。':status==='sending'?'正在准备发送；上一题仍在生成时，会先停止再发送新题。':status==='needs_confirmation'?'请打开原网页核对本题回复，再确认网页已完成或重试。':status==='uncertain'?'模型无法确认本题，完整回复可在原网页查看。':status==='error'?'请打开原网页检查，或重试本模型。':captured?'已读取本题答案，继续检查后续更正；完成后计入汇总。':run?'正在直接读取本题网页，识别到明确答案即显示。':'发送题目后，这里显示捕获到的答案。';
-      card.querySelector('.answer-label').textContent=captured?'当前捕获':'完整答案';card.querySelector('.answer-value').textContent=valid??'—';card.querySelector('.provider-answer').classList.toggle('has-answer',Boolean(valid));
-      card.querySelector('.provider-error').textContent=result?.error||(result?.status==='uncertain'?'模型已结束，但本题无法确认；此回复不参与投票。':result?.status==='completed'&&!valid?'已确认完成，但无法提取有效完整答案。':'');card.querySelector('.provider-error').hidden=!card.querySelector('.provider-error').textContent;
+      const note=card.querySelector('.result-note');note.hidden=Boolean(valid)||showReply||status==='completed';
+      note.textContent=!enabled?'在模型设置中启用后即可使用。':status==='sending'?'正在准备发送；上一题仍在生成时，会先停止再发送新题。':status==='needs_confirmation'?'请打开原网页核对本题回复，再确认网页已完成或重试。':status==='uncertain'?'模型无法确认本题。':status==='error'?'请打开原网页检查，或重试本模型。':captured?'已读取本题答案，继续检查后续更正；完成后计入汇总。':run?'正在直接读取本题网页，识别到明确答案即显示。':'发送题目后，这里显示捕获到的答案。';
+      if(waiting)note.textContent='题目已提交，等待其余模型发题完成后统一读取回复。';
+      else if(result?.replyFinished&&status==='needs_confirmation')note.textContent='网页回复已结束，已停止读取；未识别出有效选项，可核对原回复或重试。';
+      card.querySelector('.answer-label').textContent=captured?'当前捕获':'完整答案';card.querySelector('.answer-value').textContent=valid??'—';const answer=card.querySelector('.provider-answer');answer.classList.toggle('has-answer',Boolean(valid));answer.hidden=!valid&&(showReply||['completed','uncertain','error'].includes(status));
+      const reply=card.querySelector('.provider-reply');reply.hidden=!showReply;reply.querySelector('.reply-text').textContent=showReply?result.text:'';
+      const error=card.querySelector('.provider-error');error.textContent=valid||(showReply&&status!=='error')?'':result?.error||(status==='uncertain'?'模型无法确认本题。':status==='completed'?'已确认完成，但无法提取有效完整答案。':'');error.hidden=!error.textContent;
       card.querySelector('.open-provider').disabled=this.preview;card.querySelector('.retry-provider').hidden=!enabled||!run;card.querySelector('.retry-provider').disabled=this.preview||!this.sentQuestion||['opening','sending','generating'].includes(result?.status);
       card.querySelector('.retry-provider').title=!this.sentQuestion?'重新打开的面板缺少原始题目，请清空后重新发送。':'在本模型原会话中重发本题原文和原图';
       card.querySelector('.confirm-provider').hidden=result?.status!=='needs_confirmation';card.querySelector('.confirm-provider').disabled=this.preview||!valid;
@@ -172,11 +175,12 @@ export class Dashboard{
     const completed=results.filter(r=>r.status==='completed'&&normalizeAnswer(r.answer,run?.questionType)).length;
     const captured=results.filter(r=>['generating','needs_confirmation','completed'].includes(r.status)&&normalizeAnswer(r.answer,run?.questionType)).length;
     const uncertain=results.filter(r=>r.status==='uncertain').length;
-    this.$('run-summary').textContent=run?`已捕获 ${captured} / ${run.providers.filter(p=>p.enabled).length} · 已完成 ${completed}${uncertain?` · ${uncertain} 家无法确认`:''}`:`${providers.filter(p=>p.enabled).length} 个模型已启用`;
+    const phase=run?.phase==='sending'?`发送准备中 · 已发送 ${results.filter(r=>r.submitted).length} / ${results.length} · 全部发完后开始读取`:run?.phase==='finished'?'本题已结束 · 已停止轮询':null;
+    this.$('run-summary').textContent=phase||(run?`已捕获 ${captured} / ${run.providers.filter(p=>p.enabled).length} · 已完成 ${completed}${uncertain?` · ${uncertain} 家无法确认`:''}`:`${providers.filter(p=>p.enabled).length} 个模型已启用`);
   }
   renderRecommendation(){
-    const run=this.state.run;const view=run?recommendationView(recommend(run.results,run.providers)):{title:'等待开始',reason:'生成中的回答不会参与投票，确认完成后才计入。',answer:null,status:'idle'};
-    this.$('recommendation-title').textContent=view.title;this.$('recommendation-reason').textContent=view.reason;this.$('recommendation-answer').textContent=view.answer??'';this.$('recommendation-answer').hidden=!view.answer;this.$('recommendation').dataset.status=view.status;
+    const run=this.state.run;const view=run?recommendationView(recommend(run.results,run.providers)):{title:'等待开始',answer:null,status:'idle'};
+    this.$('recommendation-title').textContent=view.title;this.$('recommendation-answer').textContent=view.answer??'';this.$('recommendation-answer').hidden=!view.answer;this.$('recommendation').dataset.status=view.status;
   }
   openSettings(){this.settingsDraft=this.state.providers.map(p=>({...p,selectors:{...p.selectors}}));this.renderSettings();this.$('settings-feedback').textContent='';this.$('settings-dialog').showModal();}
   settingsField(host,label,value,key,provider,options={}){

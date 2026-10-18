@@ -1,8 +1,8 @@
 (() => {
   if (globalThis.__edgeAnswerHubContentInstalled) return;
   globalThis.__edgeAnswerHubContentInstalled = true;
-  const BUILD = '1.2';
-  const CONTENT_REVISION = 9;
+  const BUILD = '2.0';
+  const CONTENT_REVISION = 18;
   let active = null;
   // Keep the website task until its stop action has been acknowledged.
   let pageGeneration = null;
@@ -10,6 +10,20 @@
   let clearCalibration = null;
   const allowedFields = new Set(['input', 'send', 'response', 'responseRoot', 'stop', 'done', 'attachment']);
   const current = task => active === task && !task.abort.signal.aborted;
+  const pageToken = task => `${task.runId}:${task.attempt}`;
+  const pulsePage = () => document.dispatchEvent(new Event('bingda:tick'));
+  let actionSequence = 0;
+  function pageAction(target,action,payload={}) {
+    const id = `bingda-${++actionSequence}`;
+    target.setAttribute('data-bingda-action-id',id);target.removeAttribute('data-bingda-action-result');
+    document.dispatchEvent(new CustomEvent('bingda:action',{detail:JSON.stringify({id,action,...payload})}));
+    const result = JSON.parse(target.getAttribute('data-bingda-action-result') || 'null');
+    target.removeAttribute('data-bingda-action-id');target.removeAttribute('data-bingda-action-result');
+    if(!result?.ok || result.id!==id)throw Error(result?.error || '网页提交适配未加载，请重试本模型。');
+  }
+  function releasePage(task) {
+    if (document.documentElement.getAttribute('data-bingda-active') === pageToken(task)) document.documentElement.removeAttribute('data-bingda-active');
+  }
   const send = message => { try { Promise.resolve(chrome.runtime.sendMessage(message)).catch(() => {}); } catch {} };
   function update(task, status, text = task.text || '', error = '') {
     if (!current(task)) return;
@@ -35,6 +49,17 @@
     try { return [...root.querySelectorAll(selector)]; } catch { throw Error('页面选择器无效，请重新校准控件。'); }
   }
   const find = selector => findAll(selector).find(visible);
+  async function revealLatestReply(task) {
+    if(task.provider.id!=='deepseek')return;
+    // DeepSeek virtualizes the chat list. Scrolling also mounts answers below expanded thinking.
+    for(let pass=0;pass<2&&current(task);pass++){
+      const list=find('.ds-virtual-list.ds-scroll-area');
+      if(!list||list.scrollHeight-list.clientHeight-list.scrollTop<=2)return;
+      list.scrollTo({top:list.scrollHeight,behavior:'instant'});
+      await new Promise(resolve=>setTimeout(resolve,60));
+      if(current(task))pulsePage();
+    }
+  }
   function cancel() {
     if (active) active.abort.abort();
     active = null;
@@ -52,9 +77,9 @@
       observer = new MutationObserver(check);
       observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
       timer = setTimeout(() => finish(Error(message)), timeout);
-      poll = setInterval(check, 300);
+      poll = setInterval(() => { pulsePage(); check(); }, 300);
       task?.abort.signal.addEventListener('abort', aborted, { once: true });
-      check();
+      pulsePage(); check();
     });
   }
   function normalizedParagraphText(value) {
@@ -73,6 +98,11 @@
   }
   async function fillInput(task, input, prompt) {
     input.focus();
+    if (task.provider.id === 'step') {
+      pageAction(input,'fill',{text:prompt});
+      await waitFor(task,()=>input.isConnected&&input.value===prompt,5000,'阶跃网页未接受题目文字。');
+      return;
+    }
     if (input instanceof HTMLTextAreaElement || input instanceof HTMLInputElement) {
       const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       Object.getOwnPropertyDescriptor(prototype, 'value').set.call(input, prompt);
@@ -116,7 +146,16 @@
     } catch { paste = null; }
     if (!paste) throw Error('当前浏览器无法可靠构造原图粘贴事件，请在模型页面手动粘贴原图。');
     pagePendingPaste = task;
-    input.focus(); input.dispatchEvent(paste);
+    input.focus();
+    if (['hunyuan','step'].includes(task.provider.id)) {
+      const id = pageToken(task);
+      input.setAttribute('data-bingda-upload-id', id);
+      input.removeAttribute('data-bingda-upload-result');
+      document.dispatchEvent(new CustomEvent('bingda:paste-images', {detail:JSON.stringify({id,images})}));
+      const result = JSON.parse(input.getAttribute('data-bingda-upload-result') || 'null');
+      input.removeAttribute('data-bingda-upload-id'); input.removeAttribute('data-bingda-upload-result');
+      if (!result?.ok || result.id !== id) throw Error(result?.error || `图片上传适配未加载，请刷新${task.provider.name}网页后重试。`);
+    } else input.dispatchEvent(paste);
     const uploadingVisible = element => {
       if (!visible(element)) return false;
       // DeepSeek retains the finished upload spinner inside a transparent overlay.
@@ -145,6 +184,7 @@
   function turnKey(root, providerId) {
     if (!root) return null;
     const attributes = ['data-virtual-list-item-key', 'data-message-id', 'data-answer-id', 'data-turn-id', 'id'];
+    if (providerId === 'step') attributes.unshift('data-id');
     if (providerId === 'qwen') attributes.unshift('data-chat-answers-wrap');
     if (providerId === 'hunyuan') attributes.unshift('data-trace-id');
     for (const attribute of attributes) {
@@ -156,10 +196,6 @@
       const markers = findAll('.interact-container[id^="interactContainer-"]', root);
       if (markers.length === 1) return `glm:${markers[0].getAttribute('id')}`;
     }
-    if (providerId === 'step') {
-      const marker = root.querySelector('[data-slot="collapsible-content"][id]');
-      if (marker) return `step:${marker.id}`;
-    }
     return null;
   }
   function responseEvidence(task) {
@@ -167,7 +203,8 @@
     const snapshot = task.snapshot;
     if (!snapshot) return null;
     const qwen = task.provider.id === 'qwen';
-    const finalElement = element => task.provider.id !== 'hunyuan' || !element.closest('.hyc-component-deepsearch-cot__think');
+    const finalElement = element => !(task.provider.id==='hunyuan'&&element.closest('.hyc-component-deepsearch-cot__think'))
+      && !(task.provider.id==='deepseek'&&element.closest('.ds-think-content'));
     const candidates = findAll(selectors.response).filter(finalElement);
     const rootTexts = new Map();
     const textOf = element => (element.innerText ?? element.textContent).trim();
@@ -223,6 +260,20 @@
     });
     return { text, done, stopped, ambiguous, safeRoot };
   }
+  function readReply(task) {
+    if(!current(task))throw Error('本题采集上下文已失效，请重新发送本题后再读取。');
+    if(task.pageFinished)return {ok:true,text:task.text,done:true,stopped:false,ambiguous:false,status:'completed'};
+    pulsePage();
+    const evidence=responseEvidence(task);
+    const unavailable=!evidence&&task.responseBinding&&task.status==='needs_confirmation';
+    const ambiguous=Boolean(evidence?.ambiguous||unavailable);
+    const stopped=evidence?evidence.stopped:task.provider.selectors.stop&&findAll(task.provider.selectors.stop).some(visible);
+    if(evidence&&!ambiguous)task.text=evidence.text;
+    if(evidence?.done&&!stopped&&!ambiguous){finishGeneration(task);task.status='completed';}
+    return {ok:true,text:evidence&&!ambiguous?evidence.text:'',done:Boolean(evidence?.done)&&!ambiguous,
+      stopped:Boolean(stopped),ambiguous,status:ambiguous?'needs_confirmation':task.status||'generating',
+      error:unavailable?'本题回复节点已无法可靠定位，请查看原网页确认。':''};
+  }
   function generationFinished(task) {
     if (task.pageFinished) return true;
     const evidence = responseEvidence(task);
@@ -242,84 +293,22 @@
     return Boolean(pagePendingPaste);
   }
   function canStartGeneration(provider, previous) {
-    if (provider.id === 'step' && findAll('button[aria-label="发送"] .lucide-loader-circle').some(visible)) return false;
     if (provider.selectors?.stop && findAll(provider.selectors.stop).some(visible)) return false;
     if (!previous) return true;
     if (retainedPrompt(previous)) return true;
     // GLM hides/remounts older answer controls; use its current idle composer to release old capture state.
     if (provider.id === 'glm' && ready(find(provider.selectors?.input)) && findAll('.enter:not(.searching)').some(visible)) return true;
+    if (provider.id === 'step' && ready(find(provider.selectors?.input)) && findAll('button:has(.custom-icon-send-outline)').some(visible)) return true;
     return generationFinished(previous);
   }
   function pressControl(provider, button) {
-    if (provider.sendEvent === 'mousedown') button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, buttons: 1, view: window }));
+    if (provider.id === 'step') pageAction(button,'click');
+    else if (provider.sendEvent === 'mousedown') button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, buttons: 1, view: window }));
     else button.click();
-  }
-  async function initializeMode(task) {
-    const label = element => (element.innerText ?? element.textContent).replace(/\s+/g, '');
-    const named = (selector, pattern) => findAll(selector).find(element => ready(element) && pattern.test(label(element)));
-    const control = (selector, pattern) => waitFor(task, () => pattern ? named(selector, pattern) : find(selector), 5000,
-      `无法设置初始模式 ${task.provider.defaultMode}，请打开原网页检查模型选项。`);
-    const verify = predicate => waitFor(task, predicate, 5000, `初始模式 ${task.provider.defaultMode} 未生效，尚未发送题目。`);
-    const id = task.provider.id;
-    if (id === 'deepseek') {
-      for (const pattern of [/^深度思考$/, /^(智能搜索|联网搜索)$/]) {
-        const toggle = await control('.ds-toggle-button', pattern);
-        if (toggle.getAttribute('aria-pressed') !== 'true') toggle.click();
-        await verify(() => toggle.getAttribute('aria-pressed') === 'true');
-      }
-    } else if (id === 'step') {
-      const trigger = await control('button[aria-label="选择模型"]');
-      if (label(trigger) !== 'Step5Preview') {
-        trigger.click();
-        (await control('[role="menuitem"],[role="menuitemradio"]', /^Step5Preview/)).click();
-      }
-      await verify(() => label(trigger) === 'Step5Preview');
-    } else if (id === 'qwen') {
-      const trigger = await control('button[aria-haspopup="menu"]', /^(快速|思考研究)$/);
-      if (label(trigger) !== '快速') {
-        trigger.click();
-        (await control('[role="menuitemradio"],[role="menuitemcheckbox"],[role="menuitem"]', /^快速/)).click();
-      }
-      await verify(() => label(trigger) === '快速');
-    } else if (id === 'glm') {
-      const trigger = await control('.think-mode-trigger');
-      const flashPattern = /^GLM-Flash.*5\.3-Flash/;
-      if (!named('.think-mode-item', flashPattern)) trigger.click();
-      const flash = await control('.think-mode-item', flashPattern);
-      if (!flash.classList.contains('selected')) flash.click();
-      if (!label(trigger).includes('深度')) {
-        if (!named('.think-mode-item', flashPattern)) trigger.click();
-        (await control('.item-name-container')).click();
-        (await control('.think-mode-item', /^深度/)).click();
-      }
-      await verify(() => label(trigger).includes('GLM-Flash') && label(trigger).includes('深度'));
-      find(task.provider.selectors.input)?.click();
-    } else if (id === 'hunyuan') {
-      const trigger = await control('button[aria-label="切换模型"]');
-      if (trigger.getAttribute('aria-expanded') !== 'true') trigger.click();
-      let model = await control('button[aria-label="选择模型"]');
-      if (!/Hy3$/i.test(label(model))) {
-        model.click();
-        (await control('[role="menuitemradio"]', /^Hy3/i)).click();
-        await verify(() => trigger.getAttribute('aria-expanded') === 'false' || /Hy3$/i.test(label(find('button[aria-label="选择模型"]') || model)));
-        if (trigger.getAttribute('aria-expanded') !== 'true') trigger.click();
-        model = await control('button[aria-label="选择模型"]');
-      }
-      await verify(() => /Hy3$/i.test(label(model)));
-      const deep = await control('[role="menuitemradio"]', /^深度思考/);
-      if (deep.getAttribute('aria-checked') === 'true') trigger.click();
-      else deep.click();
-      await verify(() => label(trigger).includes('深度思考'));
-    }
-    if (!current(task)) return;
-    const ack = await chrome.runtime.sendMessage({type:'site:defaultsApplied',providerId:id,runId:task.runId,attempt:task.attempt});
-    if (!ack?.ok) throw Error('初始模式未能保存，请重试本模型。');
   }
   async function interruptGeneration(task, provider, previous = pageGeneration) {
     let requested = Boolean(previous?.stopRequested);
     await waitFor(task, () => {
-      // Step first shows a pending spinner, then exposes its clickable stop control.
-      if (provider.id === 'step' && findAll('button[aria-label="发送"] .lucide-loader-circle').some(visible)) return false;
       const stop = find(provider.selectors?.stop);
       if (stop) {
         if (!requested) {
@@ -338,57 +327,8 @@
   }
   function finishGeneration(task) {
     task.pageFinished = true;
+    releasePage(task);
     if (pageGeneration === task) pageGeneration = null;
-    clearTimeout(task.responseTimer);
-    task.finishMonitor?.();
-  }
-  function monitor(task) {
-    const selectors = task.provider.selectors;
-    let observer;
-    const cleanup = () => { observer?.disconnect(); };
-    task.abort.signal.addEventListener('abort', cleanup, { once: true });
-    const check = () => {
-      if (!current(task) || !task.sent || task.pageFinished) return;
-      try {
-        const evidence = responseEvidence(task);
-        const stopped = evidence ? evidence.stopped : selectors.stop && findAll(selectors.stop).some(visible);
-        if (stopped) {
-          update(task, 'generating', evidence?.ambiguous ? '' : evidence?.text ?? '');
-          return;
-        }
-        if (!evidence) {
-          if (task.responseDeadlineReached && !task.text) {
-            const composer = find(selectors.input);
-            const retained = composer && (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement ? composer.value.trim() : editableText(composer).trim());
-            if (retained) {
-              update(task, 'needs_confirmation', '', '题目仍留输入框，网页未接受发送动作，请查看原页面。');
-              return;
-            }
-          }
-          update(task, 'generating', '');
-          return;
-        }
-        const { text, done, ambiguous } = evidence;
-        if (ambiguous) {
-          update(task, 'needs_confirmation', '', '历史回复节点已重新挂载，无法可靠确认本题回复归属，请查看原页面确认。');
-          return;
-        }
-        if (done) {
-          finishGeneration(task);
-          update(task, 'completed', text); return;
-        }
-        // Pauses and missing stop buttons do not prove completion: search/tool steps can be quiet.
-        update(task, 'generating', text);
-      } catch (error) { update(task, 'error', task.text, error.message); task.finishMonitor?.(); }
-    };
-    observer = new MutationObserver(check);
-    observer.observe(document.documentElement, { subtree: true, childList: true, characterData: true, attributes: true });
-    // Explicit completion checks also catch property/CSS changes without text mutations.
-    const poll = setInterval(check, 1000);
-    task.abort.signal.addEventListener('abort', () => clearInterval(poll), { once: true });
-    const originalCleanup = cleanup;
-    task.finishMonitor = () => { originalCleanup(); clearInterval(poll); };
-    return check;
   }
   async function execute(task, message) {
     try {
@@ -398,26 +338,29 @@
       if (!selectors?.input || !selectors.send || !selectors.response) throw Error('请先配置输入、发送和模型回复控件。');
       for (const field of Object.keys(selectors)) if (selectors[field]) findAll(selectors[field]);
       if (/^(?:body|html|\*)$/i.test(selectors.response.trim()) || findAll(selectors.response).some(element => element === document.body || element === document.documentElement)) throw Error('回复控件不能选择整页正文，请重新校准。');
-      if (typeof message.prompt !== 'string' || !message.prompt.trim()) throw Error('题目提示词为空。');
+      if (typeof message.prompt !== 'string' || (!message.prompt.trim()&&!message.question?.images?.length)) throw Error('题目文字与图片均为空。');
       task.prompt = message.prompt;
       const images = message.question?.images;
       if (!Array.isArray(images) || images.length > 4 || images.reduce((total, image) => total + (image?.size || 0), 0) > 20 * 1024 * 1024) throw Error('图片数量或总大小无效。');
       // A new question supersedes the old one. Stop it before touching the composer or images.
+      await revealLatestReply(task);
+      if(!current(task))return;
       await interruptGeneration(task, task.provider, task.previousGeneration);
       if (!current(task)) return;
       if (pageGeneration === task.previousGeneration) pageGeneration = null;
       task.previousGeneration = null;
       const input = await waitFor(task, () => { const element = find(selectors.input); return ready(element) && element; }, 5000, '找不到可用的题目输入框，请确认登录或校准页面。');
       if (!current(task)) return;
-      if (message.initializeMode === true) await initializeMode(task);
-      if (!current(task)) return;
       if (selectors.attachment && findAll(selectors.attachment).some(visible)) throw Error('输入区仍有旧图片或旧附件，请先在原页面移除，避免混入下一题。');
-      await fillInput(task, input, message.prompt);
+      if(message.prompt)await fillInput(task, input, message.prompt);
+      else if((input instanceof HTMLTextAreaElement||input instanceof HTMLInputElement?input.value:editableText(input)).trim())throw Error('输入区仍有未发送文字，请先清空后重试图片题。');
       await uploadImages(task, images, selectors, input);
       const button = await waitFor(task, () => { const element = find(selectors.send); return ready(element) && element; }, 5000, '发送按钮不可用，请确认登录、模式或附件状态。');
       if (!current(task)) return;
       if (selectors.stop && findAll(selectors.stop).some(visible)) throw Error('请等待原网页上一题生成结束后再发送，当前页面正在生成。');
       if (!images.length && selectors.attachment && findAll(selectors.attachment).some(visible)) throw Error('输入区出现旧图片或旧附件，已阻止混入下一题，请在原页面清除。');
+      await revealLatestReply(task);
+      if(!current(task))return;
       const baselineReplies = new Set(findAll(selectors.response));
       const baselineRoots = new Set(selectors.responseRoot ? [...baselineReplies].map(element => element.closest(selectors.responseRoot)).filter(root => root && root !== document.body && root !== document.documentElement) : []);
       task.snapshot = { replies: baselineReplies, done: new Set(findAll(selectors.done)), roots: baselineRoots,
@@ -429,24 +372,25 @@
         task.snapshot.rootTexts = new Map([...baselineRoots].map(root => [root, [...baselineReplies].filter(element => root.contains(element)).map(textOf).join('\n')]));
         task.snapshot.rootReplyTexts = new Map([...baselineRoots].map(root => [root, new Set([...baselineReplies].filter(element => root.contains(element)).map(textOf))]));
       }
-      const check = monitor(task);
       const sendEvent = task.provider.sendEvent === 'mousedown' ? 'mousedown' : 'click';
       const diagnostic = { build: BUILD, contentRevision: CONTENT_REVISION, providerId: task.provider.id, runId: task.runId,
         sendSelector: selectors.send, targetTag: button.tagName, targetClass: button.getAttribute('class') || '', sendEvent };
       console.info('[并答诊断]', JSON.stringify({ ...diagnostic, phase: 'before-send' }));
       task.sent = true; pageGeneration = task;
       pressControl(task.provider, button);
+      await waitFor(task,()=>{
+        const composer=find(selectors.input);
+        const text=composer instanceof HTMLTextAreaElement||composer instanceof HTMLInputElement?composer.value:composer&&editableText(composer);
+        const evidence=responseEvidence(task);
+        const cleared=composer&&text.trim()===''&&(!images.length||!findAll(selectors.attachment).some(visible));
+        return cleared || findAll(selectors.stop).some(visible) || (evidence&&!evidence.ambiguous);
+      },8000,`${task.provider.name}网页未接受发送，题目仍在输入框；请重试本模型。`);
+      if(!current(task))return;
+      task.submitted=true;
       hasPendingPaste();
       console.info('[并答诊断]', JSON.stringify({ ...diagnostic, phase: 'after-send' }));
-      update(task, 'generating'); check();
-      if (task.pageFinished) return;
-      task.responseTimer = setTimeout(() => {
-        if (!current(task) || task.pageFinished) return;
-        task.responseDeadlineReached = true;
-        check();
-      }, 45000);
-      task.abort.signal.addEventListener('abort', () => clearTimeout(task.responseTimer), { once: true });
-    } catch (error) { if (current(task)) { task.finishMonitor?.(); update(task, 'error', task.text, error.message); } }
+      update(task, 'generating');
+    } catch (error) { if (current(task)) { releasePage(task); update(task, 'error', task.text, error.message); } }
   }
   function exactSelector(element) {
     const escape = value => CSS.escape(value);
@@ -481,40 +425,38 @@
     if (sender?.id !== chrome.runtime.id) return false;
     try {
       if (message?.type === 'site:ping') respond({ ok: true, build: BUILD, contentRevision: CONTENT_REVISION });
-      else if (message?.type === 'site:read') {
+      else if (message?.type === 'site:read' || message?.type === 'site:status') {
         const task = active;
         if (!task || !current(task) || message.providerId !== task.provider.id || message.runId !== task.runId || message.attempt !== task.attempt) {
           throw Error('本题采集上下文已失效，请重新发送本题后再读取。');
         }
+        if(message.type==='site:status'){
+          respond({ok:true,submitted:Boolean(task.submitted),status:task.status||'sending',done:Boolean(task.pageFinished),text:task.pageFinished?task.text:'',error:task.error||''});return false;
+        }
         // A restarted background may read a queued task before it has sent. Never return the previous reply.
-        if (!task.sent) {
+        if (!task.submitted) {
           respond({ ok: true, text: '', done: false, stopped: false, ambiguous: false,
             status: task.status === 'error' ? 'error' : 'sending', error: task.error || '' });
           return false;
         }
-        const evidence = responseEvidence(task);
-        const unavailable = !evidence && task.responseBinding && (task.pageFinished || task.status === 'needs_confirmation');
-        const ambiguous = Boolean(evidence?.ambiguous || unavailable);
-        const stopped = evidence ? evidence.stopped : task.provider.selectors.stop && findAll(task.provider.selectors.stop).some(visible);
-        // A direct read can observe completion before the DOM monitor does. Release the same lifecycle state.
-        if (evidence?.done && !stopped && !ambiguous) {
-          finishGeneration(task);
-          task.status = 'completed';
+        if(task.pageFinished){respond({ok:true,text:task.text,done:true,stopped:false,ambiguous:false,status:'completed'});return false;}
+        if(task.provider.id==='deepseek'){
+          revealLatestReply(task).then(()=>respond(readReply(task))).catch(error=>respond({ok:false,error:error.message}));
+          return true;
         }
-        respond({ ok: true, text: evidence && !ambiguous ? evidence.text : '', done: Boolean(evidence?.done) && !ambiguous,
-          stopped: Boolean(stopped), ambiguous, status: ambiguous ? 'needs_confirmation' : task.status || 'generating',
-          error: unavailable ? '本题回复节点已无法可靠定位，请查看原网页确认。' : '' });
+        respond(readReply(task));
       }
       else if (message?.type === 'site:cancel') {
         const matches = active && message.runId === active.runId && message.attempt === active.attempt;
         if (matches) {
-          const provider = active.provider, previousGeneration = pageGeneration;
+          const cancelledTask = active, provider = active.provider, previousGeneration = pageGeneration;
           cancel(); clearCalibration?.();
           if (message.stopGeneration) {
-            interruptGeneration(null, provider, previousGeneration).then(() => respond({ ok: true, cancelled: true, resetRequired: hasPendingPaste() || retainedPrompt(previousGeneration) }),
-              error => respond({ ok: false, cancelled: true, error: error.message }));
+            interruptGeneration(null, provider, previousGeneration).then(() => {releasePage(cancelledTask); respond({ ok: true, cancelled: true, resetRequired: hasPendingPaste() || retainedPrompt(previousGeneration) });},
+              error => {releasePage(cancelledTask); respond({ ok: false, cancelled: true, error: error.message });});
             return true;
           }
+          releasePage(cancelledTask);
         }
         respond({ ok: true, cancelled: Boolean(matches) });
       }
@@ -532,8 +474,8 @@
             error => respond({ ok: false, error: error.message }));
           return true;
         }
-        const task = { provider: message.provider, runId: message.runId, attempt: message.attempt, abort: new AbortController(), text: '', sent: false, previousGeneration };
-        active = task; respond({ ok: true });
+        const task = { provider: message.provider, runId: message.runId, attempt: message.attempt, abort: new AbortController(), text: '', sent: false, submitted:false, previousGeneration };
+        active = task; document.documentElement.setAttribute('data-bingda-active', pageToken(task)); pulsePage(); respond({ ok: true });
         queueMicrotask(() => { if (current(task)) execute(task, message); });
       } else return false;
     } catch (error) { respond({ ok: false, error: error.message }); }

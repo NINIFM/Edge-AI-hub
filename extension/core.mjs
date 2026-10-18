@@ -17,7 +17,7 @@ function unwrapFence(value) {
 /** Recognize an explicit abstention line, never uncertainty mentioned within reasoning. */
 export function isUncertainResponse(text) {
   return typeof text === 'string' && text.split(/\r?\n/).some(line => {
-    const token = stripMarkdown(line).replace(/^(?:最终答案\s*[:：]\s*|【\s*最终答案\s*】\s*[:：]?\s*)/, '');
+    const token = stripMarkdown(line).replace(/^(?:(?:最终)?答案\s*[:：]\s*|【\s*(?:最终)?答案\s*】\s*[:：]?\s*)/, '');
     return /^(?:无法确认\s*[:：]\s*|【\s*无法确认\s*】\s*[:：]?\s*)/.test(token)
       || /^无法确认(?:\s*[（(][^（）()\r\n]*[）)])?\s*[。.!！]?\s*$/.test(token);
   });
@@ -41,43 +41,52 @@ export function normalizeAnswer(value, type) {
 }
 
 function normalizeFinalAnswer(value, type) {
-  // Some webpages decorate an explicit final answer with a trailing check mark.
-  const answer = normalizeAnswer(value, type) ?? normalizeAnswer(value.replace(/\s*[✅☑✔✓]\uFE0F?\s*$/, ''), type);
+  const clean=value.normalize('NFKC').trim();
+  if(/[?？]/.test(clean.split(/[。！!]/)[0]))return null;
+  const unpunctuated=clean.replace(/[。.!！；;]+\s*$/, '').trim();
+  const plain=unpunctuated.replace(/\s*[✅☑✔✓]\uFE0F?\s*$/, '').trim();
+  const answer=normalizeAnswer(clean,type)??normalizeAnswer(unpunctuated,type)??normalizeAnswer(plain,type);
   if (answer !== null) return answer;
-  // GLM may append an "即..." explanation to its explicit final token. Keep other prose strict.
-  const explained = value.match(/^(.+?)\s*(?:（\s*即\s*([^（）()\r\n]+)）|\(\s*即\s*([^（）()\r\n]+)\))\s*[。.]?\s*$/);
+  // An explicit final line may repeat the option text, e.g. "B.PICO 分析".
+  const labeled = plain.match(/^([A-H]+(?:[\s,，、;/；]+[A-H]+)*)\s*[.．、:：)），,。；;]\s*(\S.*)$/i);
+  if (labeled) {
+    const description = labeled[2];
+    if (/^(?:可能(?:是|为|选)|也许|不确定|无法确认|不能确认|无法确定|不能确定|待确认|待核实|待核验|maybe\b|perhaps\b|uncertain\b)/i.test(description)
+      || /也(?:有)?可能|不太确定|无法确认|不能确认|无法确定|不能确定/.test(description)
+      || /(?:^|[\s，,；;。、])[A-H]\s*[.．、:：)）]\s*\S/i.test(description)
+      || /(?:或(?:者)?|还是|\bor\b)\s*(?:选项\s*)?[A-H](?=$|[\s.．、:：)），,；;])/i.test(description)
+      || /[A-H]\s*[/／]\s*[A-H](?=$|[\s.．、:：)），,；;])/i.test(description)) return null;
+    return normalizeAnswer(labeled[1], type);
+  }
+  // Parentheses can repeat the selected option name; English letters there are not extra choices.
+  const explained = plain.match(/^(.+?)\s*\(\s*(?:即\s*)?([^（）()\r\n]+)\)\s*$/);
   if (!explained) return null;
-  const explanation = explained[2] ?? explained[3];
+  const explanation = explained[2];
   if (!explanation.trim() || /或|可能|也许|不确定|无法确认|不能确认|无法确定|不能确定|待确认|待核实|待核验/.test(explanation)) return null;
   return normalizeAnswer(explained[1], type);
 }
 
-/** Never mine option letters from reasoning. Conflicting final lines are ambiguous. */
+/** Read explicit answer declarations or conclusions, never arbitrary option letters in prose. */
 export function extractAnswer(text, type) {
   if (typeof text !== 'string' || !QUESTION_TYPES.has(type) || isUncertainResponse(text)) return null;
   const lines = text.split(/\r?\n/).map(stripMarkdown);
   const finals = [];
-  for (const line of lines) {
-    const match = line.match(/^(?:最终答案\s*[:：]\s*|【\s*最终答案\s*】\s*[:：]?\s*)(.*)$/);
-    if (match) finals.push(normalizeFinalAnswer(match[1], type));
+  const markers=[
+    /(?:^|[，,。；;！!？?\s])(?:【\s*(?:最终|正确)?答案\s*】\s*[:：]?\s*|(?:(?:本题|此题|该题)(?:的)?\s*)?(?:(?:最终|正确)?答案|正确选项)\s*(?:[:：]\s*|(?:应(?:当)?(?:为|是)|为|是)\s*[:：]?\s*))/g,
+    /(?:^|[，,。；;！!？?\s])(?:(?:因此|所以|故|综上(?:所述)?)\s*[，,:：]?\s*(?:本题\s*)?|本题\s*)(?:应选|选择|选)\s*[:：]?\s*/g
+  ];
+  for (let index = 0; index < lines.length; index++) {
+    const line=lines[index];
+    for(const marker of markers)for(const match of line.matchAll(marker)){
+      const context=line.slice(0,match.index).split(/[。！？!?；;]/).at(-1);
+      if(/(?:^|[，,\s])(?:如果|假如|假设|例如|比如|举例|示例)/.test(context))continue;
+      const value=line.slice(match.index+match[0].length).trim()||lines[index+1]||'';
+      finals.push(normalizeFinalAnswer(value,type));
+    }
   }
   if (finals.length) {
     if (finals.some(answer => answer === null)) return null;
     return new Set(finals).size === 1 ? finals[0] : null;
-  }
-  // Qwen sometimes ends with "答案：B" or "答案：\nB". Do not infer answers from prose.
-  const answers = [];
-  let lastAnswerLine = -1;
-  for (let index = 0; index < lines.length; index++) {
-    const match = lines[index].match(/^答案\s*[:：]\s*(.*)$/);
-    if (!match) continue;
-    lastAnswerLine = match[1] ? index : index + 1;
-    answers.push(normalizeAnswer(match[1] || lines[index + 1] || '', type));
-  }
-  if (answers.length) {
-    const lastTextLine = lines.findLastIndex(line => line !== '');
-    if (lastAnswerLine !== lastTextLine || answers.some(answer => answer === null)) return null;
-    return new Set(answers).size === 1 ? answers[0] : null;
   }
   return normalizeAnswer(unwrapFence(text), type);
 }
@@ -87,19 +96,22 @@ function completedAnswer(result) {
   return normalizeAnswer(result.answer, 'judgment') ?? normalizeAnswer(result.answer, 'multiple');
 }
 
-/** Vote against all enabled voters, including ones that failed or have not completed. */
-export function recommend(results = {}, providers = [], fallbackId = 'glm') {
+/** Show the most common completed answer among enabled voters. */
+export function recommend(results = {}, providers = []) {
   const configured = Array.isArray(providers) ? providers : [];
   // Duplicate configuration entries must never give one provider multiple votes.
   const voters = [...new Map(configured.filter(provider => provider?.enabled === true && provider.voting === true)
     .map(provider => [provider.id, provider])).values()];
-  const enabledFallback = configured.some(provider => provider?.id === fallbackId && provider.enabled === true);
-  const provisionalAnswer = enabledFallback ? completedAnswer(results?.[fallbackId]) : null;
-  const outcome = (status, answer, supporters, reason) => ({ status, answer, supporters, reason, provisionalAnswer });
-  if (!voters.length) return outcome('no_voters', null, [], '没有已启用的投票模型。');
+  const outcome = (status, leaders = []) => ({
+    status,
+    answer: leaders.length === 1 ? leaders[0].answer : null,
+    supporters: leaders.length === 1 ? leaders[0].supporters : [],
+    votes: leaders[0]?.supporters.length ?? 0,
+    leaders,
+  });
+  if (!voters.length) return outcome('no_voters');
 
   const groups = new Map();
-  let invalid = false;
   let pending = false;
   for (const provider of voters) {
     const result = results?.[provider.id];
@@ -107,21 +119,18 @@ export function recommend(results = {}, providers = [], fallbackId = 'glm') {
     if (answer) {
       if (!groups.has(answer)) groups.set(answer, []);
       groups.get(answer).push(provider.id);
-    } else if (result?.status === 'completed' || result?.status === 'error' || result?.status === 'uncertain') {
-      invalid = true;
-    } else {
+    } else if (!(result?.replyFinished || result?.status === 'completed' || result?.status === 'error' || result?.status === 'uncertain')) {
       pending = true;
     }
   }
-  for (const [answer, supporters] of groups) {
-    if (supporters.length > voters.length / 2) {
-      return outcome('majority', answer, supporters, `${supporters.length}/${voters.length} 个投票模型的完整答案一致，已严格过半。`);
-    }
+  if (groups.size) {
+    const mostVotes = Math.max(...[...groups.values()].map(supporters => supporters.length));
+    const leaders = [...groups].filter(([, supporters]) => supporters.length === mostVotes)
+      .map(([answer, supporters]) => ({ answer, supporters }))
+      .sort((a, b) => a.answer.localeCompare(b.answer));
+    return outcome(leaders.length === 1 ? 'plurality' : 'tie', leaders);
   }
-  if (invalid) return outcome('incomplete', null, [], '存在弃答、失败或无法提取有效答案的投票模型；结果不完整。');
-  if (pending) return outcome('pending', null, [], '尚未严格过半，等待其余投票模型完成并确认有效答案。');
-  if (provisionalAnswer) return outcome('fallback', provisionalAnswer, [fallbackId], '全部投票模型已有有效答案但未严格过半，采用 GLM 兜底答案。');
-  return outcome('incomplete', null, [], '全部投票模型已完成但未严格过半，GLM 兜底答案不可用。');
+  return outcome(pending ? 'pending' : 'incomplete');
 }
 
 function decodedSize(dataUrl, mime) {
@@ -170,10 +179,16 @@ export function validateQuestion(question) {
   return errors;
 }
 
-export function buildPrompt(question) {
-  const rule = '仅回答本题：有可靠依据时输出“最终答案：完整答案”（选择题填全部选项字母，判断题填正确或错误）；找不到可靠依据或无法确定时输出“无法确认：具体原因”，不得猜测、编造或沿用上一题答案。';
-  const imageCount = Array.isArray(question?.images) ? question.images.length : 0;
-  const imageInstruction = imageCount ? `已附 ${imageCount} 张原图，请结合本题全部图片和文字作答。` : '';
+export function buildPrompt(question, {includeInstructions = true} = {}) {
+  const rule = [
+    '这是连续答题任务。以下规则对本会话从现在起的每一道题持续生效，后续不再重复。每条消息的文字和所附全部图片组成一道独立题目，只回答当题，不沿用上一题答案。',
+    '请在内部完成审题、核实和推理。回复正文必须只有一行纯文本，且只用以下一种格式：',
+    '选择题：答案：选项字母。单选只填一个大写字母，多选将全部正确选项按字母顺序紧连，例如“答案：B”或“答案：AC”。',
+    '判断题：只回复“答案：A”或“答案：B”，按题目中的选项对应关系作答。',
+    '没有可靠依据、题目信息不足或无法确定：只回复“无法确认”，不得猜测或编造，也不要追问。',
+    '“答案：”和结果必须在同一行，不换行、不加空行。除这一行外不得输出任何内容：不附选项原文、解析、来源、引用、链接、标题、表格、Markdown、表情、客套话、追问或继续服务的建议。即使题目要求说明，也只按上述格式作答。不要确认收到，不要复述规则，直接回答本条题目。',
+    '本题：'
+  ].join('\n');
   const text = typeof question?.text === 'string' ? question.text : '';
-  return [rule, imageInstruction, text].filter(part => part !== '').join('\n');
+  return [includeInstructions ? rule : '', text].filter(part => part !== '').join('\n');
 }
